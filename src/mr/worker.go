@@ -163,6 +163,11 @@ func performReduce(taskN, nMapTasks int, reducef func(string, []string) string) 
 		}
 		i = j
 	}
+
+	err = renameReduceOutFile(tmpf.Name(), taskN)
+	if err != nil {
+		log.Fatalf("rename error: %v", err)
+	}
 }
 
 // Worker main/mrworker.go calls this function.
