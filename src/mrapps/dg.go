@@ -20,6 +20,7 @@ func Map(filename string, contents string) []mr.KeyValue {
 			line++
 			if strings.Contains(contents, "good") {
 				ans = append(ans, mr.KeyValue{Key: fmt.Sprint(line), Value: builder.String()})
+				log.Printf("%d-------%s", line, builder.String())
 			}
 			builder.Reset()
 		} else {
@@ -31,10 +32,5 @@ func Map(filename string, contents string) []mr.KeyValue {
 }
 
 func Reduce(key string, values []string) string {
-	if len(values) != 1 {
-		log.Println("len is not one")
-		return ""
-	}
-
-	return values[0]
+	return fmt.Sprint(key, "-------", values, "\n")
 }
