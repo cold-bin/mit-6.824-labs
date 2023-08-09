@@ -6,7 +6,6 @@ package main
 import (
 	"6.5840/mr"
 	"fmt"
-	"log"
 	"strings"
 )
 
@@ -18,9 +17,9 @@ func Map(filename string, contents string) []mr.KeyValue {
 	for _, r := range []rune(contents) {
 		if r == '\n' || r == '\r' {
 			line++
-			if strings.Contains(contents, "good") {
+			if strings.Contains(builder.String(), "good") {
 				ans = append(ans, mr.KeyValue{Key: fmt.Sprint(line), Value: builder.String()})
-				log.Printf("%d-------%s", line, builder.String())
+				//log.Printf("%d-------%s", line, builder.String())
 			}
 			builder.Reset()
 		} else {
@@ -32,5 +31,5 @@ func Map(filename string, contents string) []mr.KeyValue {
 }
 
 func Reduce(key string, values []string) string {
-	return fmt.Sprint(key, "-------", values, "\n")
+	return fmt.Sprint("--", values, "\n")
 }
