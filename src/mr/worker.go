@@ -184,6 +184,8 @@ func Worker(mapf func(string, string) []KeyValue,
 			performMapTask(reply.MapFileName, reply.TaskId, reply.NReduceTasks, mapf)
 		case Reduce:
 			performReduce(reply.TaskId, reply.NMapTasks, reducef)
+		case Done:
+			return
 		default:
 			log.Fatal("worker: not support this task type")
 		}
