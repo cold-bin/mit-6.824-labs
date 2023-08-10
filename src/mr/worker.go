@@ -107,7 +107,7 @@ func performMapTask(fn string, taskN int, nReduceTasks int, mapf func(string, st
 		f.Close()
 	}
 
-	// 原子重命名，其实是为了防止并发读写
+	// 原子重命名，其实是为了防止重名和原子性破坏
 	for r := 0; r < nReduceTasks; r++ {
 		err := renameIntermediateFIle(tmpFNs[r], taskN, r)
 		if err != nil {
@@ -138,7 +138,7 @@ func performReduce(taskN, nMapTasks int, reducef func(string, []string) string) 
 	// 排序
 	sort.Sort(ByKey(kvs))
 
-	// 再创建临时文件来写reduce的结果，后面通过原子重命名做到并发读写
+	// 再创建临时文件来写reduce的结果，后面通过原子重命名只有一个最终结果文件
 	tmpf, err := os.CreateTemp("", "")
 	if err != nil {
 		log.Fatalf("create temporary file error: %v", err)

@@ -226,6 +226,8 @@ func (c *Coordinator) FinishedTask(args *FinishedTaskArgs, reply *FinishedTaskRe
 
 ##### 其他
 
+**定时轮询**
+
 我们其实并不知道何时所有map任务完成或所有reduce任务完成，所以，我们需要轮询去唤醒阻塞，然后检测是否满足条件，不满就继续阻塞等待唤醒
 
 ```go
@@ -240,4 +242,179 @@ func (c *Coordinator) FinishedTask(args *FinishedTaskArgs, reply *FinishedTaskRe
 	}()
 ```
 
+**原子重命名文件与重命名**
+
+若在`mapf`或之后要使用的`reducef`中，进程由于某些原因退出了，这样产生的文件就是不完整的。但`reduce`任务分不清哪些是成功的`map`任务输出，哪些不是。所以，我们一开始不使用`mr-m-n`形式的文件名，而是创建一个命名不确定的**临时文件**。当所有任务成功完成之后，再把这个文件重命名为正确的`mr-m-n`。
+
+reduce的输出临时文件与map任务差不多。
+
 #### worker
+
+worker的职责就是负责执行map或reduce任务。lab里要求仅仅只是实现一个单机多进程的mapreduce。
+
+1. 首先，worker要去coordinator那里调用拿任务的rpc，刚开始map没执行完毕拿的是map任务；后面执行完毕则拿的是reduce任务；
+2. 然后，拿到任务就执行，执行完毕时，需要调用完成任务的rpc，返回coodinator一些信息
+3. 最后，不断循环这个过程，以复用worker的资源
+
+```go
+func Worker(mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string) {
+
+	// Your worker implementation here.
+	for {
+		args := GetTaskArgs{}
+		reply := GetTaskReply{}
+		call("Coordinator.GetTask", &args, &reply)
+		switch reply.TaskType {
+		case Map:
+			performMapTask(reply.MapFileName, reply.TaskId, reply.NReduceTasks, mapf)
+		case Reduce:
+			performReduce(reply.TaskId, reply.NMapTasks, reducef)
+		case Done:
+			return
+		default:
+			log.Fatal("worker: not support this task type")
+		}
+
+		call("Coordinator.FinishedTask",
+			&FinishedTaskArgs{TaskId: reply.TaskId, TaskType: reply.TaskType}, &FinishedTaskReply{})
+	}
+}
+```
+
+##### 如何执行map任务
+
+1. 首先，打开输入文件，读取所有文件数据（这里lab简单规定一个文件一个分区，对应一个map任务，忽略论文中的分区
+2. 然后，调用map函数得到中间结果
+3. 再将中间结果序列化写入R个临时文件（先通过哈希函数找到key的分区）（一是可以避免文件名重复，二是为了map和reduce的原子性，例如可以避免中途断电时，使得最后只有一部分结果这种情况。
+4. 最后，我们map执行已经完毕了，这时我们再将临时文件重命名为map的中间文件结果，以供reduce任务读取
+
+```go
+func performMapTask(fn string, taskN int, nReduceTasks int, mapf func(string, string) []KeyValue) {
+	f, err := os.Open(fn)
+	if err != nil {
+		log.Fatalf("open error:%v", err)
+	}
+
+	content, err := io.ReadAll(f)
+	if err != nil {
+		log.Fatalf("read error:%v", err)
+	}
+	f.Close()
+
+	kvs := mapf(fn, quickB2S(content))
+
+	// 处理中间文件
+	tmpFs := make([]*os.File, 0, nReduceTasks)
+	tmpFNs := make([]string, 0, nReduceTasks)
+	encoders := make([]*json.Encoder, 0, nReduceTasks)
+
+	for r := 0; r < nReduceTasks; r++ {
+		tmpF, err := os.CreateTemp("", "")
+		if err != nil {
+			log.Fatalf("create temporary file error: %v", err)
+		}
+
+		tmpFs = append(tmpFs, tmpF)
+		tmpFNs = append(tmpFNs, tmpF.Name())
+		encoders = append(encoders, json.NewEncoder(tmpF))
+	}
+
+	// 写入临时的中间文件
+	// 先json编码
+	for _, kv := range kvs {
+		err := encoders[ihash(kv.Key)%nReduceTasks].Encode(&kv)
+		if err != nil {
+			log.Fatalf("json encode error: %v", err)
+		}
+	}
+
+	// 关闭临时文件
+	for _, f := range tmpFs {
+		f.Close()
+	}
+
+	// 原子重命名，其实是为了防止重名和原子性破坏
+	for r := 0; r < nReduceTasks; r++ {
+		err := renameIntermediateFIle(tmpFNs[r], taskN, r)
+		if err != nil {
+			log.Fatalf("rename error: %v", err)
+		}
+	}
+}
+```
+
+##### 如何执行reduce任务
+
+1. 首先打开map输出的中间文件，并反序列化文件内容，拿到`(key,list(values))`；
+2. 然后对输入列表排序，让中间 key/value pair 数据的处理顺序是按照 key 值增量顺序处理。方便后面实现随机存取；
+3. 再次，我们还是通过创建临时文件来保存我们的结果，然后开始聚合相同`key`的数据集；
+4. 最后，我们的reduce任务已经完毕了，这时我们再将临时文件重命名为reduce的输出文件。
+
+```go
+func performReduce(taskN, nMapTasks int, reducef func(string, []string) string) {
+	kvs := make([]KeyValue, 0)
+	for i := 0; i < nMapTasks; i++ {
+		intermediatef := getIntermediateFIle(i, taskN)
+		f, err := os.Open(intermediatef)
+		if err != nil {
+			log.Fatalf("open error: %v", err)
+		}
+		dec := json.NewDecoder(f)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kvs = append(kvs, kv)
+		}
+		f.Close()
+	}
+
+	// 排序
+	sort.Sort(ByKey(kvs))
+
+	// 再创建临时文件来写reduce的结果，后面通过原子重命名只有一个最终结果文件
+	tmpf, err := os.CreateTemp("", "")
+	if err != nil {
+		log.Fatalf("create temporary file error: %v", err)
+	}
+
+	// 把相同的key的所有value聚合在一起
+	i := 0
+	j := 0
+	for i < len(kvs) {
+		j = i + 1
+		for j < len(kvs) && kvs[j].Key == kvs[i].Key {
+			j++
+		}
+		vs := make([]string, 0, len(kvs))
+		for k := i; k < j; k++ {
+			vs = append(vs, kvs[k].Value)
+		}
+		output := reducef(kvs[i].Key, vs)
+		_, err := fmt.Fprintf(tmpf, "%v %v\n", kvs[i].Key, output)
+		if err != nil {
+			log.Fatalf("open or write error: %v", err)
+		}
+		i = j
+	}
+
+	err = renameReduceOutFile(tmpf.Name(), taskN)
+	if err != nil {
+		log.Fatalf("rename error: %v", err)
+	}
+}
+```
+
+## 感言
+
+论文其实大部分还是看得懂，最初的时候实现起来毫无头绪，论文给的是一个参考的、极其模糊的实现，而且还是分布式下的。但是lab里没有要求我们需要通过网络来把map worker的中间结果集输送到reduce worker机子里，仅仅只是实现一个单机多进程版本的mapreduce。
+
+这里的实现也是参考了一下lab1 Q&A 才知道我们仅仅只是做一个单机多进程版本的mapreduce，不需要考虑在网络传输map worker的中间结果集。
+
+实现上有很多有意思的地方：
+
+- 中间任务的输出结果，我们写入临时文件里，处理完毕过后，我们再重命名为最终结果文件；如果中途失败，那么我们得不到这个中间文件，因为该文件是临时文件。这样可以保证我们的map任务或reduce任务要么失败没有输出，要么成功有输出，从而保证了原子性
+- lab并不像论文中描述的：一旦map任务有一个执行完毕了，那么reduce任务就可以开始启动了。而是采取更简单的实现策略：所有map任务都完成了，才可以启动reduce任务。所以，这里需要有一个等待机制，满足“所有map任务执行完毕”的条件时，我们才能分配reduce任务。所以，这里使用`sync.Cond`来实现。
+- 如何实现“落伍者”的检测呢？我们可以记录分配任务时和完成任务时的时间差，太长就认为worker超时了。
