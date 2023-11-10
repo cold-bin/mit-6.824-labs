@@ -1,4 +1,4 @@
-> 转载自https://www.jianshu.com/p/5b3f278f8bde。里面的大多内容，都来源于原论文
+> 转载自https://www.jianshu.com/p/5b3f278f8bde。 里面的大多内容，都来源于原论文
 
 [toc]
 
@@ -18,7 +18,7 @@ GFS系统包括master、多个chunkserver以及多个client。文件被切分为
 
 
 
-master记录了文件系统的metadata，包括名字空间、权限控制信息、文件到chunk的mapping以及chunk的分布。master也负责chunk的租约管理、无用chunk的垃圾回收、chunk迁移等。master定期与chunkserver通信，向chunkserver发送指令并搜集chunkserver的状态。GFS client通过GFS的API与GFS系统通信（读写数据）。client向master请求获取metadata，真正的读写数据是直接与chunkserver交互。client和chunkserver都不cache文件数据。因为大部分应用都是基于API来streaming read 大文件且系统的文件数据太多，所以client缓存文件数据没有意义。chunkserver所在机器的Linux的buffer cache以及cache了频繁访问的数据，chunkserver也是没有去cache文件数据的。
+master记录了文件系统的metadata，包括名字空间、权限控制信息、文件到chunk的mapping以及chunk分布在哪些chunkserver上。master也负责chunk的租约管理、无用chunk的垃圾回收、chunk迁移等。master定期与chunkserver通信，向chunkserver发送指令并搜集chunkserver的状态。GFS client通过GFS的API与GFS系统通信（读写数据）。client向master请求获取metadata，真正的读写数据是直接与chunkserver交互。client和chunkserver都不cache文件数据。因为大部分应用都是基于API来streaming read 大文件且系统的文件数据太多，所以client缓存文件数据没有意义。chunkserver所在机器的Linux的buffer cache以及cache了频繁访问的数据，chunkserver也是没有去cache文件数据的。
 
 ## 二、Single Master
 
@@ -28,7 +28,7 @@ master记录了文件系统的metadata，包括名字空间、权限控制信息
 2. client通过文件名、chunk index向master查询chunk的分布
 3.  master回复chunk handler以及副本分布
 4.  client 缓存chunk的meta信息，key由文件名和chunk index组成
-5.  client从chunk的分布信息中查找距离自己最新的chunkserver，并发送查询请求。查询请求中包括chunk hander以及byte range。后续对相同chunk的查询不需要再次向master查询meta信息，因为client已经缓存了meta信息。
+5.  client从chunk的分布信息中查找距离自己最近的chunkserver，并发送查询请求。查询请求中包括chunk hander以及byte range。后续对相同chunk的查询不需要再次向master查询meta信息，因为client已经缓存了meta信息。
 
 ## 三、chunk size
 
@@ -41,7 +41,11 @@ master记录了文件系统的metadata，包括名字空间、权限控制信息
 
 ## 四、Metadata
 
-master主要存储三种类型的metadata：file和chunk的名字空间，file到chunk的mapping信息以及chunk的副本分布。所有的metadata都在master的内存中存储。前两种meta信息可以持久化存储，将操作日志存储在master的本地磁盘以及将备份日志存储在远端机器上。master不持久化存储chunk的副本分布信息，而是通过与chunkserver交互来获取chunkserver上的chunk信息。
+master主要存储三种类型的metadata：file和chunk的名字空间，file到chunk的mapping信息，chunk租约的版本信息，primary chunkserver，租约以及chunk的副本分布。所有的metadata都在master的内存中存储。前三种meta信息可以持久化存储，将操作日志存储在master的本地磁盘以及将备份日志存储在远端机器上。master不持久化存储chunk的副本分布信息，而是通过与chunkserver交互来获取chunkserver上的chunk信息。
+
+如下图：一个文件被分成多个不同的64M的chunk，而每个chunk又可以复制并分布在不同的chunkserver里。这样做可以极大提高系统的吞吐量，因为我们可以同时在多个地方读写同一个文件
+
+![image-20230822183829503](https://raw.githubusercontent.com/cold-bin/img-for-cold-bin-blog/master/img2/202308221838070.png)
 
 ### 4.1 in-memory data structure
 
@@ -74,6 +78,21 @@ meta信息在内存中，所有master的操作很快。另外，master可以高�
 可以看得出来，数据和控制使分开传输的，先传输数据，再传输控制信号，这样可以提高网络效率；另外，数据数据在传输到各个副本和primary的时候，并不是一次性将数据全部发送到所有副本和primary上，而是类似于p2p的方式，但也有所不同。引用原论文的话：
 
 > 为了充分利用每台机器的带宽，数据沿着一个 Chunk 服务器链顺序的推送，而不是以其它拓扑形式分散推送（例如，树型拓扑结构）。线性推送模式下，每台机器所有的出口带宽都用于以最快的速度传输数据，而不是在多个接受者之间分配带宽。
+
+而且，gfs提供了原子的数据追加操作——记录追加。对于客户端而言，如果一次记录追加成功了，那么GFS保证文件中至少有一条正确的记录，也就是说有可能有多条，也有可能有碎片，但些都是GFS在后台自己处理、实现的，对于写数据的用户而言无感知。如下图（主chunk和它的两个replica）：
+
+![image-20230822203814264](https://raw.githubusercontent.com/cold-bin/img-for-cold-bin-blog/master/img2/202308222038336.png)
+
+1. 首先，client 1往当前chunk追加记录A，所有的chunk server（primary chunk and its replicas）都成功追加；
+2. 然后，client 2也往当前chunk追加记录B，但是信息在传输给replica 2的途中丢失了，但是primary和replica 1都成功追加；
+3. 此时，client 3也往当前chunk追加记录C，此时，replica 2的追加不再是末尾追加，而是在所有副本中最大的offset处开始追加（如图）；
+4. 对于client 2追加记录请求的响应，client 2会收到一个error，然后重新发送这个请求，重新执行一遍。也就是重新记录追加B，并且运气好，成功。
+
+在上面的过程中，我们可以看出：
+
+- 发生某种故障（丢包等）可能导致多个replica的数据缺失，然后我们需要返回给客户端错误，让客户端再次请求，再次执行数据更新，如果运气好，primary和所有的replica都执行成功，那么就不用再次重复请求记录追加；反之，还得继续请求记录追加。
+- 校验块的checksum，可以检测出追加失败的块，从而丢弃它。客户端访问时，也会自动忽略；master也会尽快来回收这些空间。
+- gfs对于一致性的要求并非很强，我们虽然追加了不一致的数据，但是我们并没有及时处理掉它们，而是延后等待master处理。这样做，可以给我们带来性能提升。此时我们让客户端重新请求直到primary和所有的replica数据都追加成功，因此我们做到的是最终一致性。
 
 ## 六、副本分布
 
