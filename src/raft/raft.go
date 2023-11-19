@@ -196,13 +196,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidateId) {
+	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && rf.votedFor != noVote && rf.votedFor != args.CandidateId) {
 		reply.Term, reply.VoteGranted = rf.currentTerm, false
 		return
 	}
 	if args.Term > rf.currentTerm {
 		rf.role = follower
-		rf.currentTerm, rf.votedFor = args.Term, -1
+		rf.currentTerm, rf.votedFor = args.Term, noVote
 	}
 	if !(args.LastLogTerm == rf.log[len(rf.log)-1].Term /*Term*/ && args.LastLogIndex >= rf.commitIndex /*index*/) {
 		reply.Term, reply.VoteGranted = rf.currentTerm, false
