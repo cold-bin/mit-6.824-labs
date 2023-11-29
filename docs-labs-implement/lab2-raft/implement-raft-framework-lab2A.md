@@ -127,23 +127,27 @@ Lab2A只需要实现心跳、请求投票、定时任务。
 - 接受者（可能是跟随者，也可能是候选者）收到心跳后，首先判断是否可以接收请求，如果可以更换为跟随者并刷新选举超时计时器。
 
   ```go
+  
+  // rf是跟随者或者候选人
   func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
   	rf.mu.Lock()
   	defer rf.mu.Unlock()
+  	defer func() {
+  		Debug(dInfo, "after called AppendEntries S%d status{currentTerm:%d,role:%s,log:%v,lastApplied:%d,commitIndex:%d}",
+  			rf.me, rf.currentTerm, rf.role.String(), rf.log, rf.lastApplied, rf.commitIndex)
+  	}()
+  	Debug(dInfo, "before called AppendEntries S%d status{currentTerm:%d,role:%s,log:%v,lastApplied:%d,commitIndex:%d}",
+  		rf.me, rf.currentTerm, rf.role.String(), rf.log, rf.lastApplied, rf.commitIndex)
   
-  	if args.Term < rf.currentTerm {
+  	if args.Term < rf.currentTerm { /*请求的leader任期落后了，leader会变成follower，应该拒绝请求*/
   		reply.Term, reply.Success = rf.currentTerm, false
   		return
   	}
   
-  	if args.Term > rf.currentTerm {
-  		rf.currentTerm, rf.votedFor = args.Term, noVote
-  	}
-  
-  	rf.role = follower
+  	// 刷新选举超时器
+  	rf.changeRole(follower)
   	rf.electionTimer.Reset(withRandomElectionDuration())
-  
-  	return
+  	Debug(dInfo, "S%d -> S%d heartbeat, S%d reset election timer", args.LeaderId, rf.me, rf.me)
   }
   ```
 
@@ -156,8 +160,9 @@ Lab2A只需要实现心跳、请求投票、定时任务。
   > 可以酌情考虑配置一定的重试次数，超过次数过后报警
 
   ```go
-  // 领导者通过广播心跳来维护自己的权威
   func (rf *Raft) heartbeatBroadcast() {
+  	Debug(dInfo, "S%d start heartbeat broadcast", rf.me)
+  
   	n := len(rf.peers)
   	for i := 0; i < n; i++ {
   		if i == rf.me { /*skip self*/
@@ -167,21 +172,24 @@ Lab2A只需要实现心跳、请求投票、定时任务。
   		args := &AppendEntriesArgs{
   			Term:         rf.currentTerm,
   			LeaderId:     rf.me,
-  			PrevLogIndex: 0,
-  			PrevLogTerm:  0,
-  			LeaderCommit: 0,
+  			PrevLogIndex: len(rf.log) - 1,
+  			PrevLogTerm:  rf.log[len(rf.log)-1].Term,
+  			LeaderCommit: rf.commitIndex,
   		}
   
   		// 异步发送
   		go func(peer int) {
   			reply := &AppendEntriesReply{}
-  			if ok := rf.sendAppendEntries(peer, args, reply); ok {
-  				rf.mu.Lock()
-  				if reply.Term > rf.currentTerm {
-  					rf.currentTerm = reply.Term
-  					rf.role = follower
-  				}
-  				rf.mu.Unlock()
+  			if ok := rf.sendAppendEntries(peer, args, reply); !ok {
+  				return
+  			}
+  
+  			rf.mu.Lock()
+  			defer rf.mu.Unlock()
+  
+  			if reply.Term > rf.currentTerm {
+  				rf.currentTerm = reply.Term
+  				rf.changeRole(follower)
   			}
   		}(i)
   	}
@@ -201,27 +209,36 @@ Lab2A只需要实现心跳、请求投票、定时任务。
   3. 如果候选人的日志至少和自己一样新，那么就投票
 
   ```go
-  
   func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
   	// Your code here (2A, 2B).
   	rf.mu.Lock()
   	defer rf.mu.Unlock()
+  	defer func() {
+  		Debug(dInfo, "after called RequestVote, S%d status{votedFor:%d,role:%s,currentTerm:%d}",
+  			rf.me, rf.votedFor, rf.role.String(), rf.currentTerm)
+  	}()
+  	Debug(dInfo, "before called RequestVote, S%d status{votedFor:%d,role:%s,currentTerm:%d}",
+  		rf.me, rf.votedFor, rf.role.String(), rf.currentTerm)
   
-  	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && rf.votedFor != noVote && rf.votedFor != args.CandidateId) {
+  	if args.Term < rf.currentTerm { /*请求者任期较小，拒绝请求*/
   		reply.Term, reply.VoteGranted = rf.currentTerm, false
   		return
   	}
-  	if args.Term > rf.currentTerm {
-  		rf.role = follower
+  
+  	if args.Term > rf.currentTerm { /*还可以投票*/
+  		rf.changeRole(follower)
   		rf.currentTerm, rf.votedFor = args.Term, noVote
   	}
-  	if !(args.LastLogTerm == rf.log[len(rf.log)-1].Term /*Term*/ && args.LastLogIndex >= rf.commitIndex /*index*/) {
-  		reply.Term, reply.VoteGranted = rf.currentTerm, false
+  
+  	if (rf.votedFor == noVote || rf.votedFor == args.CandidateId) && rf.logUpToDate(args.LastLogTerm, args.LastLogIndex) { /*日志至少和自己一样新，才能投票，否则不能投票*/
+  		rf.votedFor = args.CandidateId
+  		rf.electionTimer.Reset(withRandomElectionDuration())
+  		Debug(dInfo, "S%d vote to S%d, S%d election timer reset", rf.me, args.CandidateId, rf.me)
+  		reply.Term, reply.VoteGranted = rf.currentTerm, true
   		return
   	}
-  	rf.votedFor = args.CandidateId
-  	rf.electionTimer.Reset(withRandomElectionDuration())
-  	reply.Term, reply.VoteGranted = rf.currentTerm, true
+  
+  	reply.Term, reply.VoteGranted = rf.currentTerm, false
   }
   ```
 
@@ -232,11 +249,13 @@ Lab2A只需要实现心跳、请求投票、定时任务。
   开始选举时，就会并发广播请求投票RPC。如果有候选者成为leader，就需要**立即**广播领导人的心跳，避免其他对等点的选举超时器超时，触发新一轮选举。
 
   ```go
+  // for candidate
   func (rf *Raft) startElection() {
   	rf.currentTerm++
   	rf.votedFor = rf.me
-  	approvedNum := int64(1) // 先给自己投一票
+  	approvedNum := 1 // 先给自己投一票
   	rf.electionTimer.Reset(withRandomElectionDuration())
+  	Debug(dInfo, "S%d start election, S%d reset election timer", rf.me, rf.me)
   	n := len(rf.peers)
   
   	args := &RequestVoteArgs{
@@ -258,8 +277,9 @@ Lab2A只需要实现心跳、请求投票、定时任务。
   
   		go func(peer int) {
   			reply := new(RequestVoteReply)
-  			if ok := rf.sendRequestVote(peer, args, reply); !ok { /* network is destroyed*/
-  				return
+  			ok := false
+  			for !ok { /* network is destroyed*/
+  				ok = rf.sendRequestVote(peer, args, reply)
   			}
   
   			rf.mu.Lock()
@@ -267,13 +287,14 @@ Lab2A只需要实现心跳、请求投票、定时任务。
   
   			if reply.Term > rf.currentTerm {
   				rf.currentTerm, rf.votedFor = reply.Term, noVote
-  				rf.role = follower
+  				rf.changeRole(follower)
   			} else if reply.Term == rf.currentTerm && rf.role == candidate /*我们需要确认此刻仍然是candidate，没有发生状态变化*/ {
   				if reply.VoteGranted {
   					approvedNum++
-  					if approvedNum > int64(n/2) { /*找到leader了，需要及时广播，防止选举超时*/
-  						rf.role = leader
+  					if approvedNum > n/2 { /*找到leader了，需要及时广播，防止选举超时*/
+  						rf.changeRole(leader)
   						rf.heartbeatBroadcast()
+  						rf.initializeLeaderEasilyLostState() /*领导人（服务器）上的易失性状态(选举后已经重新初始化)*/
   					}
   				}
   			}
@@ -297,21 +318,44 @@ func (rf *Raft) ticker() {
 		select {
 		case <-rf.electionTimer.C:
 			rf.mu.Lock()
-			rf.role = candidate
+			rf.changeRole(candidate)
 			rf.startElection()
 			rf.mu.Unlock()
-		case <-rf.heartbeatTimer.C:
+		case <-rf.heartbeatTicker.C:
 			rf.mu.Lock()
 			if rf.role == leader {
 				rf.heartbeatBroadcast()
+				rf.electionTimer.Reset(withRandomElectionDuration()) // leader广播完毕时，也应该把自己的选举超时器刷新一下
+				Debug(dInfo, "S%d reset election timer", rf.me)
 			}
+
 			rf.mu.Unlock()
 		}
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
+```
+
+#### 调试过程
+
+实现的初版能过lab2A的测试，但是会有`warning: term changed even though there were no failures`的问题。意思是，没有任何网络分区、延时等错误，但是在测试程序休眠2秒后，任期会发生变化。
+
+- 通过日志打印，我发现最开始的时候，心跳RPC只发送了一次过后就没有了，所以跟随者没有收到后续心跳RPC，从而导致跟随者频繁地选举超时并开启下一任期的选举。
+
+  解决：将原代码实现的`Timer`换成了`Ticker`，这样就不用考虑`Timer`的刷新了，因为心跳是固定时间段
+
+- 但是，问题依然还没有被解决，依然会出现上诉WARNING。我又查看了一下日志，发现选举的leader经过多次心跳过后，leader的选举超时器会发生超时。原来如此，我应该在leader发送完广播之后，也要重置自己的选举计时器。
+
+### 结果
+
+```bash
+➜  raft git:(main) VERBOSE=0 go test -race -run 2A
+Test (2A): initial election ...
+  Passed -- real time: 3.1       number of Raft peers:3          number of RPC sends:  60        number of bytes:  15050         number of Raft agreements reported:   0
+Test (2A): election after network failure ...
+  Passed -- real time: 4.6       number of Raft peers:3          number of RPC sends: 139        number of bytes:  26141         number of Raft agreements reported:   0
+Test (2A): multiple elections ...
+  Passed -- real time: 5.5       number of Raft peers:7          number of RPC sends: 675        number of bytes: 123169         number of Raft agreements reported:   0
+PASS
+ok      6.5840/raft     14.281s
 ```
 
