@@ -18,6 +18,9 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
+
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -92,6 +95,7 @@ type Raft struct {
 
 	applyMsg chan ApplyMsg // 已提交日志需要被应用到状态机里
 	conds    []*sync.Cond
+
 	// persistent states in every machine
 	currentTerm int    // 服务器已知最新的任期（在服务器首次启动时初始化为0，单调递增）
 	votedFor    int    // 当前任期内收到选票的 CandidateId，如果没有投给任何候选人 则为空
@@ -114,7 +118,7 @@ func withRandomElectionDuration() time.Duration {
 }
 
 func withStableHeartbeatDuration() time.Duration {
-	return 100 * time.Millisecond
+	return 50 * time.Millisecond
 }
 
 // 论文里安全性的保证：参数的日志是否至少和自己一样新
@@ -185,6 +189,25 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	defer func() {
+		Debug(dPersist, "S%d persisted status{currentTerm:%d,votedFor:%d,log:%v}", rf.me, rf.currentTerm, rf.votedFor, rf.log)
+	}()
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	var err error
+	if err = e.Encode(rf.log); err != nil {
+		Debug(dError, "encode log err:%v", err)
+	}
+	if err = e.Encode(rf.votedFor); err != nil {
+		Debug(dError, "encode votedFor err:%v", err)
+	}
+	if err = e.Encode(rf.currentTerm); err != nil {
+		Debug(dError, "encode currentTerm err:%v", err)
+		return
+	}
+	rf.persister.Save(w.Bytes(), nil)
 }
 
 // restore previously persisted state.
@@ -205,6 +228,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	var (
+		log         []Logt
+		currentTerm int
+		votedFor    int
+	)
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&log) != nil || d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil {
+		Debug(dError, "readPersist decode err")
+	} else {
+		rf.log = log
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -234,6 +271,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	defer func() {
 		Debug(dVote, "after called RequestVote, S%d status{votedFor:%d,role:%s,currentTerm:%d}",
 			rf.me, rf.votedFor, rf.role.String(), rf.currentTerm)
@@ -313,6 +351,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	defer func() {
 		Debug(dInfo, "after AppendEntries S%d status{currentTerm:%d,role:%s,log:%v,lastApplied:%d,commitIndex:%d,leaderCommit:%d}",
 			rf.me, rf.currentTerm, rf.role.String(), rf.log, rf.lastApplied, rf.commitIndex, args.LeaderCommit)
@@ -440,6 +479,8 @@ func (rf *Raft) ticker() {
 			}
 			rf.mu.Unlock()
 		}
+		// 减少CPU频繁旋转
+		time.Sleep(time.Duration(50+rand.Int()%300) * time.Microsecond)
 	}
 }
 
@@ -488,6 +529,7 @@ func (rf *Raft) heartbeatBroadcast() {
 			if ok := rf.sendAppendEntries(peer, args, reply); ok {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
+				defer rf.persist()
 				defer func() {
 					Debug(dLog, `after sendAppendEntries S%d, nextIndex:%d matchIndex:%d`, peer, rf.nextIndex[peer], rf.matchIndex[peer])
 				}()
@@ -554,21 +596,20 @@ func (rf *Raft) startElection() {
 
 		go func(peer int) {
 			reply := new(RequestVoteReply)
-			ok := false
-			for !rf.killed() && !ok {
-				rf.mu.Lock()
-				args := &RequestVoteArgs{
-					Term:         rf.currentTerm,
-					CandidateId:  rf.me,
-					LastLogIndex: len(rf.log) - 1,
-					LastLogTerm:  0,
-				}
-				if len(rf.log) > 0 {
-					args.LastLogTerm = rf.log[len(rf.log)-1].Term
-				}
-				rf.mu.Unlock()
+			rf.mu.Lock()
+			args := &RequestVoteArgs{
+				Term:         rf.currentTerm,
+				CandidateId:  rf.me,
+				LastLogIndex: len(rf.log) - 1,
+				LastLogTerm:  0,
+			}
+			if len(rf.log) > 0 {
+				args.LastLogTerm = rf.log[len(rf.log)-1].Term
+			}
+			rf.mu.Unlock()
 
-				ok = rf.sendRequestVote(peer, args, reply)
+			if ok := rf.sendRequestVote(peer, args, reply); !ok {
+				return
 			}
 
 			rf.mu.Lock()
@@ -623,12 +664,12 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	}
 	// Your initialization code here (2A, 2B, 2C).
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 	for i := 0; i < n; i++ {
 		rf.nextIndex[i] = len(rf.log)
 		rf.matchIndex[i] = 0
 		rf.conds[i] = sync.NewCond(&sync.Mutex{})
 	}
+	rf.readPersist(persister.ReadRaftState())
 
 	go rf.ticker()
 	go rf.applier()
