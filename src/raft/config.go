@@ -630,7 +630,7 @@ func (cfg *config) end() {
 		ncmds := cfg.maxIndex - cfg.maxIndex0   // number of Raft agreements reported
 		cfg.mu.Unlock()
 
-		fmt.Printf("  \nPassed --")
+		fmt.Printf("  Passed --")
 		fmt.Printf(" real time:%4.1f \t number of Raft peers:%d \t number of RPC sends:%4d \t number of bytes:%7d \t number of Raft agreements reported:%4d\n", t, npeers, nrpc, nbytes, ncmds)
 	}
 }

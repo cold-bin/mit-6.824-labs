@@ -193,11 +193,12 @@ func TestFollowerFailure2B(t *testing.T) {
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect((leader1 + 1) % servers)
 
+	Debug(dTest, "disconnect S%d from the network", (leader1+1)%servers)
 	// the leader and remaining follower should be
 	// able to agree despite the disconnected follower.
-	cfg.one(102, servers-1, false)
+	cfg.one(102, servers-1, false) // 2 servers
 	time.Sleep(RaftElectionTimeout)
-	cfg.one(103, servers-1, false)
+	cfg.one(103, servers-1, false) // 2 servers
 
 	// disconnect the remaining follower
 	leader2 := cfg.checkOneLeader()
@@ -273,28 +274,41 @@ func TestFailAgree2B(t *testing.T) {
 
 	cfg.begin("Test (2B): agreement after follower reconnects")
 
+	Debug(dTest, "client commit cmd %d", 101)
 	cfg.one(101, servers, false)
 
 	// disconnect one follower from the network.
 	leader := cfg.checkOneLeader()
 	cfg.disconnect((leader + 1) % servers)
-
+	Debug(dTest, "disconnect S%d from the network", (leader+1)%servers)
 	// the leader and remaining follower should be
 	// able to agree despite the disconnected follower.
+	Debug(dTest, "client commit cmd %d", 102)
 	cfg.one(102, servers-1, false)
+
+	Debug(dTest, "client commit cmd %d", 103)
 	cfg.one(103, servers-1, false)
+
 	time.Sleep(RaftElectionTimeout)
+	Debug(dTest, "client commit cmd %d", 104)
 	cfg.one(104, servers-1, false)
+
+	Debug(dTest, "client commit cmd %d", 105)
 	cfg.one(105, servers-1, false)
 
 	// re-connect
 	cfg.connect((leader + 1) % servers)
+	Debug(dTest, "re-connect S%d from the network", (leader+1)%servers)
 
 	// the full set of servers should preserve
 	// previous agreements, and be able to agree
 	// on new commands.
+	Debug(dTest, "client commit cmd %d", 106)
 	cfg.one(106, servers, true)
+
 	time.Sleep(RaftElectionTimeout)
+
+	Debug(dTest, "client commit cmd %d", 107)
 	cfg.one(107, servers, true)
 
 	cfg.end()
