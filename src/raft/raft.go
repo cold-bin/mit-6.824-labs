@@ -18,9 +18,6 @@ package raft
 //
 
 import (
-	"6.5840/labgob"
-	"bytes"
-
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -173,6 +170,13 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+// PersistentStatus 持久化状态
+type PersistentStatus struct {
+	Log         []Logt
+	CurrentTerm int
+	VotedFor    int
+}
+
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
@@ -189,29 +193,61 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
-
 	defer func() {
-		Debug(dPersist, "S%d persisted status{currentTerm:%d,votedFor:%d,log:%v}", rf.me, rf.currentTerm, rf.votedFor, rf.log)
+		Debug(dPersist, "S%d persisted status{currentTerm:%d,votedFor:%d,log:%v}",
+			rf.me, rf.currentTerm, rf.votedFor, rf.log)
 	}()
 
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	var err error
-	if err = e.Encode(rf.log); err != nil {
-		Debug(dError, "encode log err:%v", err)
-	}
-	if err = e.Encode(rf.votedFor); err != nil {
-		Debug(dError, "encode votedFor err:%v", err)
-	}
-	if err = e.Encode(rf.currentTerm); err != nil {
-		Debug(dError, "encode currentTerm err:%v", err)
-		return
-	}
-	rf.persister.Save(w.Bytes(), nil)
+	//var err error
+	///*先把以前的状态拿到*/
+	//state := rf.persister.ReadRaftState()
+	//if state == nil || len(state) < 1 { /*第一次persist*/
+	//	curStatus := &PersistentStatus{
+	//		Log:         rf.log,
+	//		CurrentTerm: rf.currentTerm,
+	//		VotedFor:    rf.votedFor,
+	//	}
+	//
+	//	w := new(bytes.Buffer)
+	//	if err = labgob.NewEncoder(w).Encode(curStatus); err != nil {
+	//		Debug(dError, "encode err:%v", err)
+	//		return
+	//	}
+	//	rf.persister.Save(w.Bytes(), nil)
+	//} else { /*前面已经有多次persist了*/
+	//	preStatus := new(PersistentStatus)
+	//	if err = labgob.NewDecoder(bytes.NewReader(state)).Decode(preStatus); err != nil {
+	//		Debug(dError, "persist decode err:%v", err)
+	//		return
+	//	}
+	//
+	//	if len(rf.log) > len(preStatus.Log) {
+	//		preStatus.Log = append(preStatus.Log, rf.log[len(preStatus.Log):]...)
+	//	}
+	//	if rf.currentTerm != preStatus.CurrentTerm {
+	//		preStatus.CurrentTerm = rf.currentTerm
+	//	}
+	//	if rf.votedFor != preStatus.VotedFor {
+	//		preStatus.VotedFor = rf.votedFor
+	//	}
+	//
+	//	w := new(bytes.Buffer)
+	//	if err = labgob.NewEncoder(w).Encode(preStatus); err != nil {
+	//		Debug(dError, "encode err:%v", err)
+	//		return
+	//	}
+	//	rf.persister.Save(w.Bytes(), nil)
+	//}
+
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
+	defer func() {
+		Debug(dPersist, "after read persist, S%d recover to status{currentTerm:%d,votedFor:%d,log:%d}",
+			rf.me, rf.currentTerm, rf.votedFor, rf.log)
+	}()
+
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -228,20 +264,15 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
-	var (
-		log         []Logt
-		currentTerm int
-		votedFor    int
-	)
-	r := bytes.NewBuffer(data)
-	d := labgob.NewDecoder(r)
-	if d.Decode(&log) != nil || d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil {
-		Debug(dError, "readPersist decode err")
-	} else {
-		rf.log = log
-		rf.currentTerm = currentTerm
-		rf.votedFor = votedFor
-	}
+
+	//preStatus := new(PersistentStatus)
+	//if err := labgob.NewDecoder(bytes.NewBuffer(data)).Decode(preStatus); err != nil {
+	//	Debug(dError, "readPersist decode err:%v", err)
+	//	return
+	//}
+	//rf.log = preStatus.Log
+	//rf.currentTerm = preStatus.CurrentTerm
+	//rf.votedFor = preStatus.VotedFor
 }
 
 // the service says it has created a snapshot that has
@@ -448,6 +479,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	if rf.role != leader {
 		return -1, -1, false
@@ -544,6 +576,7 @@ func (rf *Raft) heartbeatBroadcast() {
 			PrevLogTerm:  rf.log[rf.nextIndex[peer]-1].Term,
 			LeaderCommit: rf.commitIndex,
 		}
+		// deep copy
 		args.Entries = append(args.Entries, rf.log[rf.nextIndex[peer]:]...)
 
 		go func(peer int) {
@@ -552,7 +585,6 @@ func (rf *Raft) heartbeatBroadcast() {
 			if ok := rf.sendAppendEntries(peer, args, reply); ok {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-				defer rf.persist()
 				defer func() {
 					Debug(dLog, `after sendAppendEntries S%d, nextIndex:%d matchIndex:%d`, peer, rf.nextIndex[peer], rf.matchIndex[peer])
 				}()
@@ -565,6 +597,7 @@ func (rf *Raft) heartbeatBroadcast() {
 				if reply.Term > rf.currentTerm { /*过期该返回*/
 					rf.changeRole(follower)
 					rf.currentTerm = reply.Term
+					rf.persist()
 					return
 				}
 
@@ -619,6 +652,7 @@ func (rf *Raft) heartbeatBroadcast() {
 func (rf *Raft) startElection() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
+	rf.persist()
 	approvedNum := 1 // 先给自己投一票
 	rf.electionTimer.Reset(withRandomElectionDuration())
 	Debug(dTimer, "S%d start election, S%d reset election timer", rf.me, rf.me)
@@ -629,21 +663,14 @@ func (rf *Raft) startElection() {
 		if i == rf.me {
 			continue
 		}
-
+		args := &RequestVoteArgs{
+			Term:         rf.currentTerm,
+			CandidateId:  rf.me,
+			LastLogIndex: len(rf.log) - 1,
+			LastLogTerm:  rf.log[len(rf.log)-1].Term,
+		}
 		go func(peer int) {
 			reply := new(RequestVoteReply)
-			rf.mu.Lock()
-			args := &RequestVoteArgs{
-				Term:         rf.currentTerm,
-				CandidateId:  rf.me,
-				LastLogIndex: len(rf.log) - 1,
-				LastLogTerm:  0,
-			}
-			if len(rf.log) > 0 {
-				args.LastLogTerm = rf.log[len(rf.log)-1].Term
-			}
-			rf.mu.Unlock()
-
 			if ok := rf.sendRequestVote(peer, args, reply); !ok {
 				return
 			}
@@ -653,6 +680,7 @@ func (rf *Raft) startElection() {
 
 			if reply.Term > rf.currentTerm {
 				rf.currentTerm, rf.votedFor = reply.Term, noVote
+				rf.persist()
 				rf.changeRole(follower)
 			} else if reply.Term == rf.currentTerm && rf.role == candidate /*我们需要确认此刻仍然是candidate，没有发生状态变化*/ {
 				if reply.VoteGranted {
