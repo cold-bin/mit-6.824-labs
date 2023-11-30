@@ -345,6 +345,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // 当前任期，对于领导人而言 它会更新自己的任期
 	Success bool // 如果跟随者所含有的条目和 PrevLogIndex 以及 PrevLogTerm 匹配上了，则为 true
+
+	XTerm  int // term in the conflicting entry (if any)
+	XIndex int // index of first entry with that term (if any)
+	XLen   int // log length
 }
 
 // rf是跟随者或者候选人
@@ -373,8 +377,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm, rf.votedFor = args.Term, noVote
 	}
 
-	if len(rf.log) <= args.PrevLogIndex /*可能rf过期，领导者已经应用了很多日志*/ ||
-		rf.log[args.PrevLogIndex].Term != args.PrevLogTerm /*该条目的任期在 prevLogIndex 上不能和 prevLogTerm 匹配上，则返回假*/ {
+	if len(rf.log) <= args.PrevLogIndex /*可能rf过期，领导者已经应用了很多日志*/ {
+		//这种情况下，该raft实例断网一段时间过后，日志落后。所以直接返回 XLen即可。
+		//leader更新nextIndex为XLen即可，表示当前raft实例缺少XLen及后面的日志，leader在下次广播时带上这些日志
+		// leader   0{0} 1{101 102 103} 5{104}	PrevLogIndex=3	nextIndex=4
+		// follower 0{0} 1{101 102 103} 5{104}  PrevLogIndex=3  nextIndex=4
+		// follower 0{0} 1{101} 5 				PrevLogIndex=1  nextIndex=1
+		reply.XTerm, reply.XIndex, reply.XLen = -1, -1, len(rf.log)
+		reply.Term, reply.Success = rf.currentTerm, false
+		return
+	}
+
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm /*冲突：该条目的任期在 prevLogIndex，上不能和 prevLogTerm 匹配上，则返回假*/ {
+		// 从后往前找冲突条目，返回最小冲突条目的索引
+		conflictIndex, conflictTerm := -1, rf.log[args.PrevLogIndex].Term
+		for i := args.PrevLogIndex; i > rf.commitIndex; i-- {
+			if rf.log[i].Term != conflictTerm {
+				break
+			}
+			conflictIndex = i
+		}
+		reply.XTerm, reply.XIndex, reply.XLen = conflictTerm, conflictIndex, len(rf.log)
 		reply.Term, reply.Success = rf.currentTerm, false
 		return
 	}
@@ -568,10 +591,23 @@ func (rf *Raft) heartbeatBroadcast() {
 						rf.commitIndex = N
 						rf.conds[rf.me].Signal()
 					}
-				} else { /*失败，减小nextIndex重试*/
-					rf.nextIndex[peer]--
-					if rf.nextIndex[peer] < 1 {
-						rf.nextIndex[peer] = 1
+				} else {
+					// 快速定位nextIndex
+					if reply.XTerm == -1 && reply.XIndex == -1 { /*Case 3: follower's log is too short*/
+						rf.nextIndex[peer] = reply.XLen
+						return
+					}
+
+					ok := false
+					for i, entry := range rf.log { /*Case 2: leader has XTerm*/
+						if entry.Term == reply.XTerm {
+							ok = true
+							rf.nextIndex[peer] = i
+						}
+					}
+
+					if !ok { /*Case 1: leader doesn't have XTerm*/
+						rf.nextIndex[peer] = reply.XIndex
 					}
 				}
 			}
