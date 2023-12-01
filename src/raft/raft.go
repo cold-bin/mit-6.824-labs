@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -186,93 +188,44 @@ type PersistentStatus struct {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
 	defer func() {
 		Debug(dPersist, "S%d persisted status{currentTerm:%d,votedFor:%d,log:%v}",
 			rf.me, rf.currentTerm, rf.votedFor, rf.log)
 	}()
 
-	//var err error
-	///*先把以前的状态拿到*/
-	//state := rf.persister.ReadRaftState()
-	//if state == nil || len(state) < 1 { /*第一次persist*/
-	//	curStatus := &PersistentStatus{
-	//		Log:         rf.log,
-	//		CurrentTerm: rf.currentTerm,
-	//		VotedFor:    rf.votedFor,
-	//	}
-	//
-	//	w := new(bytes.Buffer)
-	//	if err = labgob.NewEncoder(w).Encode(curStatus); err != nil {
-	//		Debug(dError, "encode err:%v", err)
-	//		return
-	//	}
-	//	rf.persister.Save(w.Bytes(), nil)
-	//} else { /*前面已经有多次persist了*/
-	//	preStatus := new(PersistentStatus)
-	//	if err = labgob.NewDecoder(bytes.NewReader(state)).Decode(preStatus); err != nil {
-	//		Debug(dError, "persist decode err:%v", err)
-	//		return
-	//	}
-	//
-	//	if len(rf.log) > len(preStatus.Log) {
-	//		preStatus.Log = append(preStatus.Log, rf.log[len(preStatus.Log):]...)
-	//	}
-	//	if rf.currentTerm != preStatus.CurrentTerm {
-	//		preStatus.CurrentTerm = rf.currentTerm
-	//	}
-	//	if rf.votedFor != preStatus.VotedFor {
-	//		preStatus.VotedFor = rf.votedFor
-	//	}
-	//
-	//	w := new(bytes.Buffer)
-	//	if err = labgob.NewEncoder(w).Encode(preStatus); err != nil {
-	//		Debug(dError, "encode err:%v", err)
-	//		return
-	//	}
-	//	rf.persister.Save(w.Bytes(), nil)
-	//}
+	status := &PersistentStatus{
+		Log:         rf.log,
+		CurrentTerm: rf.currentTerm,
+		VotedFor:    rf.votedFor,
+	}
 
+	w := new(bytes.Buffer)
+	if err := labgob.NewEncoder(w).Encode(status); err != nil {
+		Debug(dError, "encode err:%v", err)
+		return
+	}
+	rf.persister.Save(w.Bytes(), nil)
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
 	defer func() {
 		Debug(dPersist, "after read persist, S%d recover to status{currentTerm:%d,votedFor:%d,log:%d}",
 			rf.me, rf.currentTerm, rf.votedFor, rf.log)
 	}()
 
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	// Your code here (2C).
+	status := new(PersistentStatus)
+	if err := labgob.NewDecoder(bytes.NewBuffer(data)).Decode(status); err != nil {
+		Debug(dError, "readPersist decode err:%v", err)
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
-
-	//preStatus := new(PersistentStatus)
-	//if err := labgob.NewDecoder(bytes.NewBuffer(data)).Decode(preStatus); err != nil {
-	//	Debug(dError, "readPersist decode err:%v", err)
-	//	return
-	//}
-	//rf.log = preStatus.Log
-	//rf.currentTerm = preStatus.CurrentTerm
-	//rf.votedFor = preStatus.VotedFor
+	rf.log = status.Log
+	rf.currentTerm = status.CurrentTerm
+	rf.votedFor = status.VotedFor
 }
 
 // the service says it has created a snapshot that has
@@ -573,8 +526,17 @@ func (rf *Raft) heartbeatBroadcast() {
 			LeaderId:     rf.me,
 			Entries:      make([]Logt, 0),
 			PrevLogIndex: rf.nextIndex[peer] - 1,
-			PrevLogTerm:  rf.log[rf.nextIndex[peer]-1].Term,
+			PrevLogTerm:  0,
 			LeaderCommit: rf.commitIndex,
+		}
+		/*解决高并发场景下lab2C里索引越界的问题*/
+		if args.PrevLogIndex >= 0 && args.PrevLogIndex < len(rf.log) {
+			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+		} else {
+			args.PrevLogIndex = 0
+		}
+		if rf.nextIndex[peer] < 1 {
+			rf.nextIndex[peer] = 1
 		}
 		// deep copy
 		args.Entries = append(args.Entries, rf.log[rf.nextIndex[peer]:]...)
@@ -728,13 +690,12 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	}
 	// Your initialization code here (2A, 2B, 2C).
 	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
 	for i := 0; i < n; i++ {
+		rf.conds[i] = sync.NewCond(&sync.Mutex{})
 		rf.nextIndex[i] = len(rf.log)
 		rf.matchIndex[i] = 0
-		rf.conds[i] = sync.NewCond(&sync.Mutex{})
 	}
-	rf.readPersist(persister.ReadRaftState())
-
 	go rf.ticker()
 	go rf.applier()
 

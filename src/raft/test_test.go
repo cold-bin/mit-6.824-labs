@@ -693,38 +693,64 @@ func TestPersist12C(t *testing.T) {
 
 	cfg.begin("Test (2C): basic persistence")
 
+	Debug(dTest, "client commit cmd %d", 11)
 	cfg.one(11, servers, true)
 
 	// crash and re-start all
+	Debug(dTest, "crash and re-start all")
 	for i := 0; i < servers; i++ {
+		Debug(dTest, "S%d start", i)
 		cfg.start1(i, cfg.applier)
 	}
+
 	for i := 0; i < servers; i++ {
 		cfg.disconnect(i)
 		cfg.connect(i)
 	}
 
+	Debug(dTest, "recover all")
+
+	Debug(dTest, "client commit cmd %d", 12)
 	cfg.one(12, servers, true)
 
 	leader1 := cfg.checkOneLeader()
+
+	Debug(dTest, "leader S%d disconnect", leader1)
 	cfg.disconnect(leader1)
+	Debug(dTest, "leader S%d start", leader1)
 	cfg.start1(leader1, cfg.applier)
+	Debug(dTest, "leader S%d connect", leader1)
 	cfg.connect(leader1)
 
+	Debug(dTest, "client commit cmd %d", 13)
 	cfg.one(13, servers, true)
 
 	leader2 := cfg.checkOneLeader()
+	Debug(dTest, "leader S%d start", leader2)
 	cfg.disconnect(leader2)
+	Debug(dTest, "client commit cmd %d", 14)
 	cfg.one(14, servers-1, true)
+	Debug(dTest, "leader S%d start", leader2)
 	cfg.start1(leader2, cfg.applier)
+	Debug(dTest, "leader S%d connect", leader2)
 	cfg.connect(leader2)
 
+	// 等待 14 提交
 	cfg.wait(4, servers, -1) // wait for leader2 to join before killing i3
 
+	// 将某个follower断开网络，重新start后又联网
 	i3 := (cfg.checkOneLeader() + 1) % servers
+
+	Debug(dTest, "follower S%d disconnect", i3)
 	cfg.disconnect(i3)
+
+	Debug(dTest, "client commit cmd %d", 15)
 	cfg.one(15, servers-1, true)
+
+	Debug(dTest, "S%d start", i3)
 	cfg.start1(i3, cfg.applier)
+
+	Debug(dTest, "follower S%d connect", i3)
 	cfg.connect(i3)
 
 	cfg.one(16, servers, true)
@@ -741,38 +767,56 @@ func TestPersist22C(t *testing.T) {
 
 	index := 1
 	for iters := 0; iters < 5; iters++ {
+		Debug(dTest, "client commit cmd %d", 10+index)
 		cfg.one(10+index, servers, true)
 		index++
 
 		leader1 := cfg.checkOneLeader()
 
+		Debug(dTest, "S%d disconnect", (leader1+1)%servers)
 		cfg.disconnect((leader1 + 1) % servers)
+		Debug(dTest, "S%d disconnect", (leader1+2)%servers)
 		cfg.disconnect((leader1 + 2) % servers)
 
+		Debug(dTest, "client commit cmd %d", 10+index)
 		cfg.one(10+index, servers-2, true)
 		index++
 
+		Debug(dTest, "S%d disconnect", (leader1+0)%servers)
 		cfg.disconnect((leader1 + 0) % servers)
+		Debug(dTest, "S%d disconnect", (leader1+3)%servers)
 		cfg.disconnect((leader1 + 3) % servers)
+		Debug(dTest, "S%d disconnect", (leader1+4)%servers)
 		cfg.disconnect((leader1 + 4) % servers)
 
+		Debug(dTest, "S%d start", (leader1+1)%servers)
 		cfg.start1((leader1+1)%servers, cfg.applier)
+		Debug(dTest, "S%d start", (leader1+2)%servers)
 		cfg.start1((leader1+2)%servers, cfg.applier)
+		Debug(dTest, "follower S%d connect", (leader1+1)%servers)
+
 		cfg.connect((leader1 + 1) % servers)
+		Debug(dTest, "follower S%d connect", (leader1+2)%servers)
 		cfg.connect((leader1 + 2) % servers)
 
 		time.Sleep(RaftElectionTimeout)
 
+		Debug(dTest, "S%d start", (leader1+3)%servers)
 		cfg.start1((leader1+3)%servers, cfg.applier)
+		Debug(dTest, "follower S%d connect", (leader1+3)%servers)
 		cfg.connect((leader1 + 3) % servers)
 
+		Debug(dTest, "client commit cmd %d", 10+index)
 		cfg.one(10+index, servers-2, true)
 		index++
 
+		Debug(dTest, "follower S%d connect", (leader1+4)%servers)
 		cfg.connect((leader1 + 4) % servers)
+		Debug(dTest, "leader S%d connect", (leader1+0)%servers)
 		cfg.connect((leader1 + 0) % servers)
 	}
 
+	Debug(dTest, "client commit cmd %d", 1000)
 	cfg.one(1000, servers, true)
 
 	cfg.end()
