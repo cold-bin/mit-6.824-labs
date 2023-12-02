@@ -10,7 +10,7 @@ fi
 function tests() {
     num=$1
     while [ $num -gt 0 ]; do
-        VERBOSE=1 go test -race -run 2$2 >> test2A_$3_times
+        VERBOSE=1 go test -race -run 2$2 >> test2$2_$3_times
         let "num--"
     done
 }
