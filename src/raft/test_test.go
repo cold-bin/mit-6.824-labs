@@ -1163,9 +1163,11 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 
 	cfg.begin(name)
 
-	cfg.one(rand.Int(), servers, true)
-	leader1 := cfg.checkOneLeader()
+	randcmd := rand.Int()
+	Debug(dTest, "client commit cmd %d", randcmd)
+	cfg.one(randcmd, servers, true)
 
+	leader1 := cfg.checkOneLeader()
 	for i := 0; i < iters; i++ {
 		victim := (leader1 + 1) % servers
 		sender := leader1
@@ -1175,18 +1177,27 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 		}
 
 		if disconnect {
+			Debug(dTest, "S%d disconnect", victim)
 			cfg.disconnect(victim)
-			cfg.one(rand.Int(), servers-1, true)
+
+			randcmd = rand.Int()
+			Debug(dTest, "client commit cmd %d", randcmd)
+			cfg.one(randcmd, servers-1, true)
 		}
 		if crash {
+			Debug(dTest, "S%d crash, but saved state", victim)
 			cfg.crash1(victim)
-			cfg.one(rand.Int(), servers-1, true)
+			randcmd = rand.Int()
+			Debug(dTest, "client commit cmd %d", randcmd)
+			cfg.one(randcmd, servers-1, true)
 		}
 
 		// perhaps send enough to get a snapshot
 		nn := (SnapShotInterval / 2) + (rand.Int() % SnapShotInterval)
 		for i := 0; i < nn; i++ {
-			cfg.rafts[sender].Start(rand.Int())
+			randcmd = rand.Int()
+			Debug(dTest, "client commit cmd %d to S%d", randcmd, sender)
+			cfg.rafts[sender].Start(randcmd)
 		}
 
 		// let applier threads catch up with the Start()'s
@@ -1194,9 +1205,13 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 			// make sure all followers have caught up, so that
 			// an InstallSnapshot RPC isn't required for
 			// TestSnapshotBasic2D().
-			cfg.one(rand.Int(), servers, true)
+			randcmd = rand.Int()
+			Debug(dTest, "client commit cmd %d", randcmd)
+			cfg.one(randcmd, servers, true)
 		} else {
-			cfg.one(rand.Int(), servers-1, true)
+			randcmd = rand.Int()
+			Debug(dTest, "client commit cmd %d", randcmd)
+			cfg.one(randcmd, servers-1, true)
 		}
 
 		if cfg.LogSize() >= MAXLOGSIZE {
@@ -1205,14 +1220,26 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 		if disconnect {
 			// reconnect a follower, who maybe behind and
 			// needs to rceive a snapshot to catch up.
+			Debug(dTest, "S%d connect", victim)
 			cfg.connect(victim)
-			cfg.one(rand.Int(), servers, true)
+
+			randcmd = rand.Int()
+			Debug(dTest, "client commit cmd %d", randcmd)
+			cfg.one(randcmd, servers, true)
+
 			leader1 = cfg.checkOneLeader()
 		}
 		if crash {
+			Debug(dTest, "S%d start raft machine", victim)
 			cfg.start1(victim, cfg.applierSnap)
+
+			Debug(dTest, "S%d connect", victim)
 			cfg.connect(victim)
-			cfg.one(rand.Int(), servers, true)
+
+			randcmd = rand.Int()
+			Debug(dTest, "client commit cmd %d", randcmd)
+			cfg.one(randcmd, servers, true)
+
 			leader1 = cfg.checkOneLeader()
 		}
 	}

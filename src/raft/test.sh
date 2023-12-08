@@ -30,6 +30,10 @@ case $1 in
     echo "Test lab2C ${cnt} times..." >> test2C_${cnt}_times
     tests $cnt 'C' $cnt
     ;;
+  D)
+    echo "Test lab2D ${cnt} times..." >> test2D_${cnt}_times
+    tests $cnt 'D' $cnt
+    ;;
   *)
     echo "invalid $1"
     echo "usage: test.sh which_item test_times"
