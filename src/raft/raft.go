@@ -664,7 +664,7 @@ func (rf *Raft) ticker() {
 	}
 }
 
-// 将已提交的日志应用到状态机里。已经提交的日志和快照都走applier
+// 将已提交的日志应用到状态机里。
 // 注意：防止日志被应用状态机之前被裁减掉，也就是说，一定要等日志被应用过后才能被裁减掉。
 func (rf *Raft) applier() {
 	for rf.killed() == false {
