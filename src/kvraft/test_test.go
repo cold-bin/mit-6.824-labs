@@ -45,6 +45,7 @@ var t0 = time.Now()
 
 // get/put/putappend that keep counts
 func Get(cfg *config, ck *Clerk, key string, log *OpLog, cli int) string {
+	Debug(dTest, "C%d new get {%s}\n", cli, key)
 	start := int64(time.Since(t0))
 	v := ck.Get(key)
 	end := int64(time.Since(t0))
@@ -63,6 +64,7 @@ func Get(cfg *config, ck *Clerk, key string, log *OpLog, cli int) string {
 }
 
 func Put(cfg *config, ck *Clerk, key string, value string, log *OpLog, cli int) {
+	Debug(dTest, "C%d new Put {%s:%s}\n", cli, key, value)
 	start := int64(time.Since(t0))
 	ck.Put(key, value)
 	end := int64(time.Since(t0))
@@ -79,6 +81,7 @@ func Put(cfg *config, ck *Clerk, key string, value string, log *OpLog, cli int) 
 }
 
 func Append(cfg *config, ck *Clerk, key string, value string, log *OpLog, cli int) {
+	Debug(dTest, "C%d new append {%s:%s}\n", cli, key, value)
 	start := int64(time.Since(t0))
 	ck.Append(key, value)
 	end := int64(time.Since(t0))
@@ -290,7 +293,7 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 					v := Get(cfg, myck, key, opLog, cli)
 					// the following check only makes sense when we're not using random keys
 					if !randomkeys && v != last {
-						t.Fatalf("get wrong value, key %v, wanted:\n%v\n, got\n%v\n", key, last, v)
+						t.Fatalf("get wrong value, key %v, \nwanted:\n%v\ngot:\n%v\n", key, last, v)
 					}
 				}
 			}

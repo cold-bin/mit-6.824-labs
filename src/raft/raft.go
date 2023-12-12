@@ -72,7 +72,10 @@ func (r role) String() string {
 	}
 }
 
-const noVote = -1
+const (
+	noVote   = -1
+	NoLeader = -1
+)
 
 type Logt struct {
 	Command interface{}
@@ -90,7 +93,8 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	role role
+	role   role
+	leader int // for lab3
 
 	applyMsg chan ApplyMsg // 已提交日志需要被应用到状态机里
 	conds    []*sync.Cond
@@ -176,6 +180,12 @@ func (rf *Raft) realLogLen() int {
 	return rf.lastIncludedIndex + len(rf.log)
 }
 
+func (rf *Raft) Role() string {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.role.String()
+}
+
 // 选举后，领导人的易失状态需要重新初始化
 func (rf *Raft) initializeLeaderEasilyLostState() {
 	defer func() {
@@ -197,6 +207,13 @@ func (rf *Raft) changeRole(r role) {
 	preRole := rf.role
 	rf.role = r
 	Debug(dInfo, "S%d role %s->%s", rf.me, preRole.String(), r.String())
+}
+
+// Leader 获取leader, 没有就返回 NoLeader
+func (rf *Raft) Leader() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.leader
 }
 
 // return currentTerm and whether this server
@@ -423,8 +440,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer func() {
-		Debug(dLog, "after AppendEntries, S%d status{currentTerm:%d,role:%s,commitIndex:%d,applied:%d,lastIncludedIndex:%d,log_len:%d}",
-			rf.me, rf.currentTerm, rf.role.String(), rf.commitIndex, rf.lastApplied, rf.lastIncludedIndex, len(rf.log)-1)
+		Debug(dLog, "after AppendEntries,S%d -> S%d status{currentTerm:%d,role:%s,commitIndex:%d,applied:%d,lastIncludedIndex:%d,log_len:%d}",
+			rf.leader, rf.me, rf.currentTerm, rf.role.String(), rf.commitIndex, rf.lastApplied, rf.lastIncludedIndex, len(rf.log)-1)
 	}()
 
 	if args.Term < rf.currentTerm { /*请求的leader任期落后了，leader会变成follower，应该拒绝请求*/
@@ -441,6 +458,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm { /*请求的leader任期更大，那么rf的任期需要更新，并转化为follower,并且取消以前任期的无效投票*/
 		rf.currentTerm, rf.votedFor = args.Term, noVote
 	}
+	rf.leader = args.LeaderId
 
 	if rf.lastIncludedIndex > args.PrevLogIndex /*对等点的快照点已经超过本次日志复制的点，没有必要接受此日志复制rpc了*/ {
 		reply.Term, reply.Success = rf.currentTerm, false
@@ -518,8 +536,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer func() {
-		Debug(dSnap, "after InstallSnapshot, S%d status{currentTerm:%d,commitIndex:%d,applied:%d,lastIncludedIndex:%d,log_len:%d}",
-			rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.lastIncludedIndex, len(rf.log)-1)
+		Debug(dSnap, "after InstallSnapshot,S%d -> S%d status{currentTerm:%d,commitIndex:%d,applied:%d,lastIncludedIndex:%d,log_len:%d}",
+			rf.leader, rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.lastIncludedIndex, len(rf.log)-1)
 	}()
 
 	//1. 如果`term < currentTerm`就立即回复
@@ -531,6 +549,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.Term > rf.currentTerm /*当前raft落后，可以接着安装快照*/ {
 		rf.currentTerm, rf.votedFor = args.Term, noVote
 	}
+	rf.leader = args.LeaderId
 
 	rf.changeRole(follower)
 	rf.electionTimer.Reset(withRandomElectionDuration())
@@ -760,6 +779,7 @@ func (rf *Raft) handleSendAppendEntries(peer int, args *AppendEntriesArgs) {
 
 		if reply.Term > rf.currentTerm { /*过期该返回*/
 			rf.changeRole(follower)
+			rf.leader = NoLeader
 			rf.currentTerm = reply.Term
 			rf.persist()
 			return
@@ -793,6 +813,7 @@ func (rf *Raft) handleSendInstallSnapshot(peer int, args *InstallSnapshotArgs) {
 
 		if reply.Term > rf.currentTerm {
 			rf.changeRole(follower)
+			rf.leader = NoLeader
 			rf.currentTerm = reply.Term
 			rf.persist()
 			return
@@ -848,6 +869,7 @@ func (rf *Raft) findNextIndex(peer int, reply *AppendEntriesReply) {
 func (rf *Raft) startElection() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
+	rf.leader = NoLeader
 	rf.persist()
 	approvedNum := 1 // 先给自己投一票
 	rf.electionTimer.Reset(withRandomElectionDuration())
@@ -883,6 +905,7 @@ func (rf *Raft) startElection() {
 					approvedNum++
 					if approvedNum > n/2 { /*找到leader了，需要及时广播，防止选举超时*/
 						rf.changeRole(leader)
+						rf.leader = rf.me
 						rf.initializeLeaderEasilyLostState() /*领导人（服务器）上的易失性状态(选举后已经重新初始化)*/
 						rf.heartbeatBroadcast()
 					}
@@ -910,6 +933,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 		me:                me,
 		dead:              0,
 		role:              follower,
+		leader:            NoLeader,
 		applyMsg:          applyCh,
 		conds:             make([]*sync.Cond, n),
 		currentTerm:       0,
