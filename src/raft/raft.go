@@ -115,8 +115,9 @@ type Raft struct {
 	nextIndex  []int // 对于每一台服务器，发送到该服务器的下一个日志条目的索引（初始值为领导人最后的日志条目的索引+1）
 	matchIndex []int // 对于每一台服务器，已知的已经复制到该服务器的最高日志条目的索引（初始值为0，单调递增），作用就是ack掉成功调用日志复制的rpc
 
-	electionTimer   *time.Timer  // random timer
-	heartbeatTicker *time.Ticker // leader每隔至少100ms一次
+	electionTimer   *time.Timer   // random timer
+	heartbeatTicker *time.Ticker  // leader每隔至少100ms一次
+	replicateSignal chan struct{} // leader log快速replicate的信号
 }
 
 func withRandomElectionDuration() time.Duration {
@@ -560,6 +561,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 
+	if args.LastIncludedIndex <= rf.commitIndex /*leader快照点小于当前提交点*/ {
+		reply.Term = rf.currentTerm
+		return
+	}
+
 	defer rf.persist()
 
 	rf.lastIncludedIndex = args.LastIncludedIndex
@@ -613,7 +619,6 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-// 一致性协议由心跳开启，这样就不用区分心跳和日志复制了
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
@@ -635,6 +640,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.persist()
 	rf.matchIndex[rf.me], rf.nextIndex[rf.me] = rf.lastLogIndex(), rf.realLogLen()
 	index, term, isLeader = rf.lastLogIndex(), rf.currentTerm, true
+
+	// 快速唤醒log replicate
+	go func() {
+		rf.replicateSignal <- struct{}{}
+	}()
 
 	Debug(dLog, "S%d Start cmd:%v,index:%d", rf.me, command, index)
 	return index, term, isLeader
@@ -659,33 +669,49 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) ticker() {
+func (rf *Raft) electionEvent() {
 	for rf.killed() == false {
-		// Your code here (2A)
-		// Check if a leader election should be started.
 		select {
 		case <-rf.electionTimer.C:
 			rf.mu.Lock()
 			rf.changeRole(candidate)
 			rf.startElection()
 			rf.mu.Unlock()
+		}
+	}
+}
+
+func (rf *Raft) heartbeatEvent() {
+	for rf.killed() == false {
+		select {
 		case <-rf.heartbeatTicker.C:
 			rf.mu.Lock()
 			if rf.role == leader {
 				rf.heartbeatBroadcast()
 				rf.electionTimer.Reset(withRandomElectionDuration()) // leader广播完毕时，也应该把自己的选举超时器刷新一下
-				//Debug(dTimer, "S%d reset election timer", rf.me)
 			}
 			rf.mu.Unlock()
 		}
-		// 减少CPU频繁旋转
-		time.Sleep(time.Duration(50+rand.Int()%300) * time.Microsecond)
+	}
+}
+
+func (rf *Raft) logReplicateEvent() {
+	for rf.killed() == false {
+		select {
+		case <-rf.replicateSignal:
+			rf.mu.Lock()
+			if rf.role == leader {
+				rf.heartbeatBroadcast()
+				rf.electionTimer.Reset(withRandomElectionDuration())
+			}
+			rf.mu.Unlock()
+		}
 	}
 }
 
 // 将已提交的日志应用到状态机里。
 // 注意：防止日志被应用状态机之前被裁减掉，也就是说，一定要等日志被应用过后才能被裁减掉。
-func (rf *Raft) applier() {
+func (rf *Raft) applierEvent() {
 	for rf.killed() == false {
 		rf.conds[rf.me].L.Lock()
 		rf.conds[rf.me].Wait()
@@ -699,16 +725,12 @@ func (rf *Raft) applier() {
 				Command:      rf.log[rf.logIndex(i)].Command,
 				CommandIndex: i,
 			})
+			rf.lastApplied++
 		}
 		rf.mu.Unlock()
 
 		for _, msg := range msgs {
 			rf.applyMsg <- msg
-
-			rf.mu.Lock()
-			rf.lastApplied++
-			Debug(dLog2, "applied, S%d applier status{lastApplied:%d,commitIndex:%d}", rf.me, rf.lastApplied, rf.commitIndex)
-			rf.mu.Unlock()
 		}
 	}
 }
@@ -946,6 +968,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 		matchIndex:        make([]int, n),
 		electionTimer:     time.NewTimer(withRandomElectionDuration()),
 		heartbeatTicker:   time.NewTicker(withStableHeartbeatDuration()),
+		replicateSignal:   make(chan struct{}),
 	}
 	// Your initialization code here (2A, 2B, 2C).
 	// initialize from state persisted before a crash
@@ -953,8 +976,12 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	for i := 0; i < n; i++ {
 		rf.conds[i] = sync.NewCond(&sync.Mutex{})
 	}
-	go rf.ticker()
-	go rf.applier()
+
+	// 注册事件驱动并监听
+	go rf.electionEvent()     // 选举协程
+	go rf.heartbeatEvent()    // 心跳协程
+	go rf.logReplicateEvent() // replicate协程
+	go rf.applierEvent()      // apply协程
 
 	return rf
 }

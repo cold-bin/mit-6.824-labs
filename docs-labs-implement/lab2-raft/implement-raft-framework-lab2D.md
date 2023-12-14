@@ -281,7 +281,7 @@ if rf.log[index].Term != args.PrevLogTerm {
 因为集群中所有节点的情况一致，也就是`PrevLogIndex`和`lastIncludedIndex`的值是一样的，
 所以就会出现`rf.log[0].Term != args.PrevLogTerm`的情况，进而日志复制失败，nextIndex回退的问题。
 
-修复的方式有两种：一种是额外处理相等情况；还有一种方法就是，每次快照的时候初始化`rf.log[0].Term`为`lastIncludedTerm`即可。我采用的是第二种。采用第二种方案就不需要持久化存储`lastIncludedTerm`了
+修复的方式有两种：一种是额外处理相等情况；还有一种方法就是，每次快照的时候初始化`rf.log[0].Term`为`lastIncludedTerm`即可。我采用的是第二种。采用第二种方案就不需要raft中暂存`lastIncludedTerm`了
 
 
 #### 调试`test 2`
