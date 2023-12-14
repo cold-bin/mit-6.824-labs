@@ -117,7 +117,7 @@ type Raft struct {
 
 	electionTimer   *time.Timer   // random timer
 	heartbeatTicker *time.Ticker  // leader每隔至少100ms一次
-	replicateSignal chan struct{} // leader log快速replicate的信号
+	replicateSignal chan struct{} // 新增的 leader log快速replicate的信号
 }
 
 func withRandomElectionDuration() time.Duration {
@@ -192,7 +192,6 @@ func (rf *Raft) initializeLeaderEasilyLostState() {
 	defer func() {
 		Debug(dLeader, "after S%d initializeLeaderEasilyLostState,nextIndex:%v,matchIndex:%v", rf.me, rf.nextIndex, rf.matchIndex)
 	}()
-	//Debug(dLeader, "before S%d initializeLeaderEasilyLostState,nextIndex:%v,matchIndex:%v", rf.me, rf.nextIndex, rf.matchIndex)
 
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i] = rf.realLogLen()
