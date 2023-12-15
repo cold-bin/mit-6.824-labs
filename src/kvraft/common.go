@@ -20,12 +20,12 @@ type PutAppendArgs struct {
 	Key        string
 	Value      string
 	Op         string // "Put" or "Append"
-	ClientId   int64  //发送消息的clerk编号
-	SequenceId int64  //这个clerk发送的第几条信息
+	ClientId   int64
+	SequenceId int64
 }
 
 type PutAppendReply struct {
-	Leader bool // 为真表示不是leader
+	Leader bool // 为真表示是leader
 	Err    Err
 }
 
