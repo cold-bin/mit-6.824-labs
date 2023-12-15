@@ -226,6 +226,10 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 		} else if m.CommandValid {
 			if m.CommandIndex != cfg.lastApplied[i]+1 {
 				err_msg = fmt.Sprintf("server %v apply out of order, expected index %v, got %v", i, cfg.lastApplied[i]+1, m.CommandIndex)
+				cfg.mu.Lock()
+				fmt.Printf("lastIncludedIndex:%d,lastApplied:%d,commitIndex:%d\n",
+					rf.lastIncludedIndex, rf.lastApplied, rf.commitIndex)
+				cfg.mu.Unlock()
 			}
 
 			if err_msg == "" {

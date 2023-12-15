@@ -2,16 +2,15 @@ package kvraft
 
 import (
 	"6.5840/labrpc"
-	"time"
 )
 import "crypto/rand"
 import "math/big"
 
 type Clerk struct {
 	servers    []*labrpc.ClientEnd
-	clientId   int64
-	SequenceId int64
-	leader     int // 缓存leader，减少轮询
+	leader     int   // 缓存leader
+	clientId   int64 // 标识客户端
+	sequenceId int64 // 表示相同客户端发起的不同rpc. 重复rpc具有相同的此项值
 }
 
 func nrand() int64 {
@@ -24,9 +23,9 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	return &Clerk{
 		servers:    servers,
-		clientId:   nrand(),
-		SequenceId: 0,
 		leader:     0,
+		clientId:   nrand(),
+		sequenceId: 0,
 	}
 }
 
@@ -43,35 +42,25 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // 串行调用的，无需上锁（保证每个客户端一次只能一次rpc）
 func (ck *Clerk) Get(key string) string {
 	defer func() {
-		Debug(dGet, "C%d(Seq %d) -> S%d Get {key:%s}", ck.clientId, ck.SequenceId, ck.leader, key)
+		Debug(dGet, "C%d(Seq %d) -> S%d Get {key:%s}", ck.clientId, ck.sequenceId, ck.leader, key)
 	}()
-
-	// steps:
-	// 1、向leader发送rpc
-	// 2、如果网络分区、延时或者已经不再是leader了，那么就找下一个server
 	args := &GetArgs{
 		Key:        key,
 		ClientId:   ck.clientId,
-		SequenceId: ck.SequenceId,
+		SequenceId: ck.sequenceId,
 	}
-	reply := &GetReply{}
-	ck.SequenceId++
-
+	ck.sequenceId++
 	server := ck.leader
+
 	for {
-		if ok := ck.servers[server].Call("KVServer.Get", args, reply); !ok /*网络分区*/ ||
-			reply.Err == ErrWrongLeader /*对等点不是leader*/ {
-			server = (server + 1) % len(ck.servers) // 继续发送下一个server
-		} else if reply.Err == ErrNoKey || reply.Err == OK {
-			// leader成功响应
+		reply := &GetReply{}
+		if ok := ck.servers[server].Call("KVServer.Get", args, reply); ok /*网络正常*/ &&
+			reply.Leader /*请求的是leader*/ {
 			ck.leader = server
-			if reply.Err == ErrNoKey {
-				return ""
-			} else if reply.Err == OK {
-				return reply.Value
-			}
+			return reply.Value
+		} else /*网路分区或请求的不是leader，请求下一个*/ {
+			server = (server + 1) % len(ck.servers)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -85,7 +74,7 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	defer func() {
-		Debug(dGet, "C%d(Seq %d) -> S%d %s {key:%s}", ck.clientId, ck.SequenceId, ck.leader, op, key)
+		Debug(dGet, "C%d(Seq %d) -> S%d %s {key:%s}", ck.clientId, ck.sequenceId, ck.leader, op, key)
 	}()
 	// like Clerk.Get
 	args := &PutAppendArgs{
@@ -93,22 +82,20 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Value:      value,
 		Op:         op,
 		ClientId:   ck.clientId,
-		SequenceId: ck.SequenceId,
+		SequenceId: ck.sequenceId,
 	}
-	reply := &PutAppendReply{}
-	ck.SequenceId++
-
+	ck.sequenceId++
 	server := ck.leader
+
 	for {
-		if ok := ck.servers[server].Call("KVServer.PutAppend", args, reply); !ok /*网络分区*/ ||
-			reply.Err == ErrWrongLeader /*对等点不是leader*/ {
-			server = (server + 1) % len(ck.servers) // 继续发送下一个server
-		} else if reply.Err == ErrNoKey || reply.Err == OK {
-			// leader成功响应
+		reply := &PutAppendReply{}
+		if ok := ck.servers[server].Call("KVServer.PutAppend", args, reply); ok /*网络正常一定返回 Err=OK*/ &&
+			reply.Leader /*请求的是leader*/ {
 			ck.leader = server
-			break
+			return
+		} else /*网路分区或请求的不是leader，请求下一个*/ {
+			server = (server + 1) % len(ck.servers)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 

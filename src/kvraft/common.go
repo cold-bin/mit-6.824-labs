@@ -9,9 +9,8 @@ import (
 )
 
 const (
-	OK             Err = "OK"             // 请求成功
-	ErrNoKey       Err = "ErrNoKey"       // key 不存在
-	ErrWrongLeader Err = "ErrWrongLeader" // 请求的raft实例不是leader
+	OK       Err = "OK"       // 请求成功
+	ErrNoKey Err = "ErrNoKey" // key 不存在
 )
 
 type Err string
@@ -21,12 +20,13 @@ type PutAppendArgs struct {
 	Key        string
 	Value      string
 	Op         string // "Put" or "Append"
-	ClientId   int64
-	SequenceId int64
+	ClientId   int64  //发送消息的clerk编号
+	SequenceId int64  //这个clerk发送的第几条信息
 }
 
 type PutAppendReply struct {
-	Err Err
+	Leader bool // 为真表示不是leader
+	Err    Err
 }
 
 type GetArgs struct {
@@ -36,8 +36,9 @@ type GetArgs struct {
 }
 
 type GetReply struct {
-	Err   Err
-	Value string
+	Leader bool
+	Err    Err
+	Value  string
 }
 
 type logTopic string
@@ -52,6 +53,7 @@ const (
 	dGet    logTopic = "S_GET"
 	dPut    logTopic = "S_PUT"
 	dAppend logTopic = "S_APPEND"
+	dApply  logTopic = "S_APPLY"
 )
 
 var debugStart time.Time

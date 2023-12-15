@@ -43,6 +43,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 
 	// For 2D:
 	SnapshotValid bool
@@ -97,7 +98,7 @@ type Raft struct {
 	leader int // for lab3
 
 	applyMsg chan ApplyMsg // 已提交日志需要被应用到状态机里
-	conds    []*sync.Cond
+	cond     *sync.Cond
 
 	// persistent states in every machine
 	currentTerm       int    // 服务器已知最新的任期（在服务器首次启动时初始化为0，单调递增）
@@ -508,7 +509,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, rf.lastLogIndex())
-		rf.conds[rf.me].Signal()
+		rf.cond.Signal()
 	}
 
 	reply.Term, reply.Success = rf.currentTerm, true
@@ -712,17 +713,17 @@ func (rf *Raft) logReplicateEvent() {
 // 注意：防止日志被应用状态机之前被裁减掉，也就是说，一定要等日志被应用过后才能被裁减掉。
 func (rf *Raft) applierEvent() {
 	for rf.killed() == false {
-		rf.conds[rf.me].L.Lock()
-		rf.conds[rf.me].Wait()
-		rf.conds[rf.me].L.Unlock()
-
 		rf.mu.Lock()
+		for rf.lastApplied >= rf.commitIndex {
+			rf.cond.Wait()
+		}
 		msgs := make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			msgs = append(msgs, ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log[rf.logIndex(i)].Command,
 				CommandIndex: i,
+				CommandTerm:  rf.log[rf.logIndex(i)].Term,
 			})
 			rf.lastApplied++
 		}
@@ -863,7 +864,7 @@ func (rf *Raft) checkAndCommitLogs() {
 	if N > rf.commitIndex { /*leader可以提交了*/
 		Debug(dLog, `S%d commit to index: %d, and lastIncludedIndex:%d`, rf.me, N, rf.lastIncludedIndex)
 		rf.commitIndex = N
-		rf.conds[rf.me].Signal()
+		rf.cond.Signal()
 	}
 }
 
@@ -949,14 +950,14 @@ func (rf *Raft) startElection() {
 func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 	n := len(peers)
 	rf := &Raft{
-		peers:             peers,
-		persister:         persister,
-		me:                me,
-		dead:              0,
-		role:              follower,
-		leader:            NoLeader,
-		applyMsg:          applyCh,
-		conds:             make([]*sync.Cond, n),
+		peers:     peers,
+		persister: persister,
+		me:        me,
+		dead:      0,
+		role:      follower,
+		leader:    NoLeader,
+		applyMsg:  applyCh,
+		//cond:              sync.NewCond(&sync.Mutex{}),
 		currentTerm:       0,
 		votedFor:          noVote,
 		log:               make([]Logt, 1),
@@ -972,9 +973,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// Your initialization code here (2A, 2B, 2C).
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	for i := 0; i < n; i++ {
-		rf.conds[i] = sync.NewCond(&sync.Mutex{})
-	}
+	rf.cond = sync.NewCond(&rf.mu)
 
 	// 注册事件驱动并监听
 	go rf.electionEvent()     // 选举协程

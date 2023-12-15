@@ -16,17 +16,16 @@ const (
 	PUT    OpType = "Put"
 	APPEND OpType = "Append"
 )
+const rpcTimeout = time.Second
 
 // Op 描述Put/Append/Get操作, raft.Logt 中的Command
 type Op struct {
-	Type       OpType
+	Type       OpType //Put or Append or Get
 	Key        string
 	Value      string
-	ClientID   int64
+	ClientId   int64
 	SequenceId int64
 }
-
-const WaitLeaderTimeout = time.Second // kvserver等待选举的最大时间
 
 type KVServer struct {
 	mu      sync.Mutex
@@ -37,13 +36,9 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	duptable map[int64]Entry   // 客户端请求的reply去重 key:client id value: rpc reply and sequenceId
-	data     map[string]string // 缓存
-}
-
-type Entry struct {
-	sequenceId int64
-	reply      interface{}
+	duptable   map[int64]int64 //判重
+	data       map[string]string
+	wakeClient map[int]chan int // 存储每个index处的term，用以唤醒客户端
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -51,186 +46,104 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		Debug(dGet, "S%d(%s) Get args{%+v} reply{%+v}", kv.me, kv.rf.Role(), args, reply)
 	}()
 
-	// steps：
-	// 1、等待leader选举成功
-	if ok := kv.waitLeader(); !ok /*等待超时*/ {
-		reply.Value, reply.Err = "", ErrWrongLeader
-		return
+	op := Op{
+		Type:       GET,
+		Key:        args.Key,
+		ClientId:   args.ClientId,
+		SequenceId: args.SequenceId,
 	}
 
-	// 2、如果不是leader，则return
-	if _, leader := kv.rf.GetState(); !leader {
-		reply.Value, reply.Err = "", ErrWrongLeader
+	// 如果是leader则会追加成功；否则会失败并返回当前不是leader的错误，客户端定位下一个server
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Value, reply.Err, reply.Leader = "", ErrNoKey, false
 		return
 	}
 
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
+	ch := make(chan int)
+	kv.wakeClient[index] = ch
+	kv.mu.Unlock()
 
-	// 3、检查重复rpc，如果table里已经有了rpc的reply了，则直接复用return
-	if v, ok := kv.duptable[args.ClientId]; ok && v.sequenceId == args.SequenceId {
-		oldreply := v.reply.(*GetReply)
-		reply.Value, reply.Err = oldreply.Value, oldreply.Err
-		return
-	}
+	// 延迟释放资源
+	defer func() {
+		go kv.clean(index)
+	}()
 
-	// 4、调用Start，先将log放入raft进行log replicate
-	op := Op{
-		Type:       GET,
-		Key:        args.Key,
-		ClientID:   args.ClientId,
-		SequenceId: args.SequenceId,
-	}
-	index, _, leader := kv.rf.Start(op)
-	if !leader {
-		reply.Value, reply.Err = "", ErrWrongLeader
-		return
-	}
-
-	// 5、kvserver等待底层raft applied后，也就是applyCh管道拿到command，等待执行command
-	msg := <-kv.applyCh
-	if msg.CommandValid {
-		if msg.CommandIndex == index /*是期待的index*/ {
-			// 继续后续的步骤
-		} else /*不是期待的log*/ {
-			Debug(dGet, "not expect log{%+v}: index(%d)!=cmdIndex(%d)", msg, index, msg.CommandIndex)
-			reply.Value, reply.Err = "", ErrWrongLeader
+	select {
+	case <-time.After(rpcTimeout) /*超时还没有提交*/ :
+	case msgTerm := <-ch /*阻塞等待唤醒*/ :
+		if msgTerm == term /*term一样表示当前leader不是过期的leader*/ {
+			kv.mu.Lock()
+			if val, ok := kv.data[args.Key]; ok {
+				reply.Value, reply.Err, reply.Leader = val, OK, true
+			} else {
+				reply.Value, reply.Err, reply.Leader = "", ErrNoKey, true
+			}
+			kv.mu.Unlock()
 			return
 		}
-	} else if msg.SnapshotValid {
 	}
 
-	// 6、再次检查table，是否已经含有reply，如果已经有了，没有必要执行command了；如果没有，则继续执行command，并记录于table中
-	if v, ok := kv.duptable[args.ClientId]; ok && v.sequenceId == args.SequenceId {
-		oldreply := v.reply.(*GetReply)
-		reply.Value, reply.Err = oldreply.Value, oldreply.Err
-		return
-	} else /*没有重复，则执行command并记录reply*/ {
-		val, err := kv.operator(&op)
-		reply.Value, reply.Err = val, err
-		kv.duptable[args.ClientId] = Entry{
-			sequenceId: args.SequenceId,
-			reply:      reply,
-		}
-	}
-	// 7、然后reply客户端
+	reply.Value, reply.Err, reply.Leader = "", ErrNoKey, false
+	return
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	defer func() {
 		Debug(dAppend, "S%d(%s) PutAppend args{%+v} reply{%+v}", kv.me, kv.rf.Role(), args, reply)
 	}()
-	// steps：
-	// 1、等待leader选举成功
-	if ok := kv.waitLeader(); !ok /*等待超时*/ {
-		reply.Err = ErrWrongLeader
-		return
-	}
-	// 2、如果不是leader，则return
-	if _, leader := kv.rf.GetState(); !leader {
-		reply.Err = ErrWrongLeader
-		return
-	}
 
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	// 3、检查重复rpc，如果table里已经有了rpc的reply了，则直接复用return
-	if v, ok := kv.duptable[args.ClientId]; ok && v.sequenceId == args.SequenceId {
-		oldreply := v.reply.(*PutAppendReply)
-		reply.Err = oldreply.Err
-		return
-	}
-
-	// 4、调用Start，先将log放入raft进行log replicate
 	op := Op{
 		Type:       OpType(args.Op),
 		Key:        args.Key,
 		Value:      args.Value,
-		ClientID:   args.ClientId,
+		ClientId:   args.ClientId,
 		SequenceId: args.SequenceId,
 	}
-	index, _, leader := kv.rf.Start(op)
-	if !leader {
-		reply.Err = ErrWrongLeader
+
+	kv.mu.Lock()
+	// 如果follower或leader已经请求过了，可以直接返回了
+	if ind, ok := kv.duptable[args.ClientId]; ok && ind >= args.SequenceId {
+		kv.mu.Unlock()
+		reply.Err, reply.Leader = OK, true
+		return
+	}
+	kv.mu.Unlock()
+
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err, reply.Leader = OK, false
 		return
 	}
 
-	// 5、kvserver等待底层raft applied后，也就是applyCh管道拿到command，等待执行command
-	msg := <-kv.applyCh
-	if msg.CommandValid {
-		if msg.CommandIndex == index /*是期待的index*/ {
-			// 继续后续的步骤
-		} else /*不是期待的log*/ {
-			Debug(dAppend, "not expect log{%+v}: index(%d)!=cmdIndex(%d)", msg, index, msg.CommandIndex)
-			reply.Err = ErrWrongLeader
+	kv.mu.Lock()
+	ch := make(chan int)
+	kv.wakeClient[index] = ch
+	kv.mu.Unlock()
+
+	defer func() {
+		go kv.clean(index)
+	}()
+
+	select {
+	case <-time.After(rpcTimeout):
+	case msgTerm := <-ch /*阻塞等待*/ :
+		if msgTerm == term /*term一样表示当前leader不是过期的leader*/ {
+			reply.Err, reply.Leader = OK, true
 			return
 		}
-	} else if msg.SnapshotValid {
 	}
 
-	// 6、再次检查table，是否已经含有reply，如果已经有了，没有必要执行command了；如果没有，则继续执行command，并记录于table中
-	if v, ok := kv.duptable[args.ClientId]; ok && v.sequenceId == args.SequenceId {
-		oldreply := v.reply.(*PutAppendReply)
-		reply.Err = oldreply.Err
-		return
-	} else /*没有重复，则执行command并记录reply*/ {
-		_, reply.Err = kv.operator(&op)
-		kv.duptable[args.ClientId] = Entry{
-			sequenceId: args.SequenceId,
-			reply:      reply,
-		}
-	}
-	// 7、然后reply客户端
-}
-
-// Op.Type
-//
-//	  Get：获取当前key的value，没有则返回“”
-//	  Get：获取当前key的value，没有则返回“”
-//	  Put：key存在则替换，不存在则新增
-//	Append：key存在则追加，不存在则新增
-func (kv *KVServer) operator(op *Op) (val string, err Err) {
-	defer func() {
-		Debug(dInfo, "operator:{%+v},return{val:%s,err:%v}", op, val, err)
-	}()
-	// operate
-	switch op.Type {
-	case PUT:
-		kv.data[op.Key] = op.Value
-		err = OK
-	case APPEND:
-		kv.data[op.Key] = kv.data[op.Key] + op.Value
-		err = OK
-	case GET:
-		// 看key的存在情况
-		if _, ok := kv.data[op.Key]; !ok /*key不存在*/ {
-			err = ErrNoKey
-		} else /*key存在*/ {
-			err = OK
-		}
-	default:
-	}
-
-	val = kv.data[op.Key]
+	reply.Err, reply.Leader = OK, false
 	return
 }
 
-// 阻塞到leader出现
-func (kv *KVServer) waitLeader() bool {
-	timer := time.NewTimer(WaitLeaderTimeout)
-	for !kv.killed() {
-		select {
-		case <-timer.C:
-			break
-		default:
-			if kv.rf.Leader() != raft.NoLeader {
-				return true
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return kv.rf.Leader() != raft.NoLeader
+func (kv *KVServer) clean(i int) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	close(kv.wakeClient[i])
+	delete(kv.wakeClient, i)
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -255,7 +168,7 @@ func (kv *KVServer) killed() bool {
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
-// me is the index of the current server in servers[].
+// clientId is the index of the current server in servers[].
 // the k/v server should data snapshots through the underlying Raft
 // implementation, which should call persister.SaveStateAndSnapshot() to
 // atomically save the Raft state along with the snapshot.
@@ -275,9 +188,52 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		applyCh:      applyCh,
 		dead:         0,
 		maxraftstate: maxraftstate,
-		duptable:     make(map[int64]Entry),
+		duptable:     make(map[int64]int64),
 		data:         make(map[string]string),
+		wakeClient:   make(map[int]chan int),
 	}
 
+	go kv.apply()
+
 	return kv
+}
+
+// raft提交的command，应用层应用，这个是针对所有的server
+// 对于leader：把所有已提交的command，执行并应用到状态机中；并且leader也需要让客户端reply
+// 对于follower：也需要把已提交的command，执行并应用到状态机中；follower没有客户端请求，无需等待
+// 应用状态机的时候，只需要应用Put/Append即可，Get不会对状态机造成任何影响
+func (kv *KVServer) apply() {
+	for msg := range kv.applyCh {
+
+		kv.mu.Lock()
+		index := msg.CommandIndex
+		term := msg.CommandTerm
+		op := msg.Command.(Op)
+
+		if preSequenceId, ok := kv.duptable[op.ClientId]; ok &&
+			preSequenceId == op.SequenceId /*应用前需要再判一次重*/ {
+		} else /*没有重复，可以应用状态机并记录在table里*/ {
+			kv.duptable[op.ClientId] = op.SequenceId
+			switch op.Type {
+			case PUT:
+				kv.data[op.Key] = op.Value
+			case APPEND:
+				if _, ok := kv.data[op.Key]; ok {
+					kv.data[op.Key] = kv.data[op.Key] + op.Value
+				} else {
+					kv.data[op.Key] = op.Value
+				}
+			case GET:
+				/*noting*/
+			}
+		}
+
+		if ch, ok := kv.wakeClient[index]; ok /*leader唤醒客户端reply*/ {
+			Debug(dClient, "S%d wakeup client", kv.me)
+			ch <- term
+		}
+		Debug(dApply, "apply msg{%+v}", msg)
+
+		kv.mu.Unlock()
+	}
 }
