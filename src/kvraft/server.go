@@ -4,6 +4,7 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"bytes"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,6 +36,8 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+	persister    *raft.Persister
+	lastApplied  int // 用于快照
 
 	duptable   map[int64]int64 //判重
 	data       map[string]string
@@ -188,14 +191,56 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		applyCh:      applyCh,
 		dead:         0,
 		maxraftstate: maxraftstate,
+		persister:    persister,
+		lastApplied:  0,
 		duptable:     make(map[int64]int64),
 		data:         make(map[string]string),
 		wakeClient:   make(map[int]chan int),
 	}
 
+	kv.replay()
+
 	go kv.apply()
+	go kv.snapshot()
 
 	return kv
+}
+
+// 快照和持久化log重放
+func (kv *KVServer) replay() {
+	snapshotStatus := &SnapshotStatus{}
+	if err := labgob.NewDecoder(bytes.NewBuffer(kv.persister.ReadSnapshot())).Decode(snapshotStatus); err != nil {
+		Debug(dError, "snapshot gob encode snapshotStatus err:%v", err)
+		return
+	}
+	kv.lastApplied = snapshotStatus.LastApplied
+	kv.data = snapshotStatus.Data
+	kv.duptable = snapshotStatus.Duptable
+}
+
+func (kv *KVServer) snapshot() {
+	if kv.maxraftstate == -1 {
+		return
+	}
+
+	for !kv.killed() {
+		kv.mu.Lock()
+		if kv.maxraftstate <= kv.persister.RaftStateSize() {
+			snapshotStatus := &SnapshotStatus{
+				LastApplied: kv.lastApplied,
+				Data:        kv.data,
+				Duptable:    kv.duptable,
+			}
+			w := new(bytes.Buffer)
+			if err := labgob.NewEncoder(w).Encode(snapshotStatus); err != nil {
+				Debug(dError, "snapshot gob encode snapshotStatus err:%v", err)
+				return
+			}
+			kv.rf.Snapshot(kv.lastApplied, w.Bytes())
+		}
+		kv.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // raft提交的command，应用层应用，这个是针对所有的server
@@ -206,33 +251,46 @@ func (kv *KVServer) apply() {
 	for msg := range kv.applyCh {
 
 		kv.mu.Lock()
-		index := msg.CommandIndex
-		term := msg.CommandTerm
-		op := msg.Command.(Op)
+		if msg.CommandValid {
+			index := msg.CommandIndex
+			term := msg.CommandTerm
+			op := msg.Command.(Op)
 
-		if preSequenceId, ok := kv.duptable[op.ClientId]; ok &&
-			preSequenceId == op.SequenceId /*应用前需要再判一次重*/ {
-		} else /*没有重复，可以应用状态机并记录在table里*/ {
-			kv.duptable[op.ClientId] = op.SequenceId
-			switch op.Type {
-			case PUT:
-				kv.data[op.Key] = op.Value
-			case APPEND:
-				if _, ok := kv.data[op.Key]; ok {
-					kv.data[op.Key] = kv.data[op.Key] + op.Value
-				} else {
+			if preSequenceId, ok := kv.duptable[op.ClientId]; ok &&
+				preSequenceId == op.SequenceId /*应用前需要再判一次重*/ {
+			} else /*没有重复，可以应用状态机并记录在table里*/ {
+				kv.duptable[op.ClientId] = op.SequenceId
+				switch op.Type {
+				case PUT:
 					kv.data[op.Key] = op.Value
+				case APPEND:
+					if _, ok := kv.data[op.Key]; ok {
+						kv.data[op.Key] = kv.data[op.Key] + op.Value
+					} else {
+						kv.data[op.Key] = op.Value
+					}
+				case GET:
+					/*noting*/
 				}
-			case GET:
-				/*noting*/
 			}
-		}
 
-		if ch, ok := kv.wakeClient[index]; ok /*leader唤醒客户端reply*/ {
-			Debug(dClient, "S%d wakeup client", kv.me)
-			ch <- term
+			if ch, ok := kv.wakeClient[index]; ok /*leader唤醒客户端reply*/ {
+				Debug(dClient, "S%d wakeup client", kv.me)
+				ch <- term
+			}
+			Debug(dApply, "apply msg{%+v}", msg)
+			kv.lastApplied++
+		} else if msg.SnapshotValid /*follower使用快照重置状态机*/ {
+			snapshotStatus := &SnapshotStatus{}
+			if err := labgob.NewDecoder(bytes.NewBuffer(msg.Snapshot)).Decode(snapshotStatus); err != nil {
+				Debug(dError, "snapshot gob encode snapshotStatus err:%v", err)
+				return
+			}
+			kv.lastApplied = snapshotStatus.LastApplied
+			kv.data = snapshotStatus.Data
+			kv.duptable = snapshotStatus.Duptable
+			Debug(dSnap, "snapshot lastApplied:%d", snapshotStatus.LastApplied)
 		}
-		Debug(dApply, "apply msg{%+v}", msg)
 
 		kv.mu.Unlock()
 	}

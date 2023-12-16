@@ -41,6 +41,12 @@ type GetReply struct {
 	Value  string
 }
 
+type SnapshotStatus struct {
+	LastApplied int
+	Data        map[string]string
+	Duptable    map[int64]int64
+}
+
 type logTopic string
 
 const (
@@ -54,6 +60,7 @@ const (
 	dPut    logTopic = "S_PUT"
 	dAppend logTopic = "S_APPEND"
 	dApply  logTopic = "S_APPLY"
+	dSnap   logTopic = "S_SNAP"
 )
 
 var debugStart time.Time
