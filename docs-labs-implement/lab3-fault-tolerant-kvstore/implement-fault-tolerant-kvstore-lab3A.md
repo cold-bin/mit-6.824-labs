@@ -151,7 +151,10 @@ func (ck *Clerk) Append(key string, value string) {
 ```
 
 #### server rpc实现
-
+- Get
+  1. 先调用`Start`在raft中达成共识
+  2. kvserver应用层等待raft提交并应用command
+  3. 应用状态机过后，才可以返回；否则超时失败返回
 ```go
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	defer func() {
@@ -201,7 +204,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	reply.Value, reply.Err, reply.Leader = "", ErrNoKey, false
 	return
 }
-
+```
+- Put/Append
+  1. 由于该类请求会改变状态机，所以不能重复执行，先按照tips里去重。如果已经请求过了，那么可以直接返回
+  2. 后面的步骤和Get一样了
+```go
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	defer func() {
 		Debug(dAppend, "S%d(%s) PutAppend args{%+v} reply{%+v}", kv.me, kv.rf.Role(), args, reply)
@@ -252,6 +259,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	return
 }
 ```
+
 
 #### 额外的apply实现
 
