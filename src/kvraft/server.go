@@ -206,7 +206,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	return kv
 }
 
-// 快照和持久化log重放
+// 快照重放
 func (kv *KVServer) replay() {
 	snapshotStatus := &SnapshotStatus{}
 	if err := labgob.NewDecoder(bytes.NewBuffer(kv.persister.ReadSnapshot())).Decode(snapshotStatus); err != nil {
