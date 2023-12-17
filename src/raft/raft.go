@@ -714,9 +714,7 @@ func (rf *Raft) logReplicateEvent() {
 func (rf *Raft) applierEvent() {
 	for rf.killed() == false {
 		rf.mu.Lock()
-		for rf.lastApplied >= rf.commitIndex {
-			rf.cond.Wait()
-		}
+		rf.cond.Wait()
 		msgs := make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			msgs = append(msgs, ApplyMsg{

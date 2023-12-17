@@ -5,6 +5,7 @@ import (
 	"6.5840/labrpc"
 	"6.5840/raft"
 	"bytes"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -201,15 +202,18 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.replay()
 
 	go kv.apply()
-	go kv.snapshot()
 
 	return kv
 }
 
 // 快照重放
 func (kv *KVServer) replay() {
+	snapshot := kv.persister.ReadSnapshot()
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
 	snapshotStatus := &SnapshotStatus{}
-	if err := labgob.NewDecoder(bytes.NewBuffer(kv.persister.ReadSnapshot())).Decode(snapshotStatus); err != nil {
+	if err := labgob.NewDecoder(bytes.NewBuffer(snapshot)).Decode(snapshotStatus); err != nil {
 		Debug(dError, "snapshot gob encode snapshotStatus err:%v", err)
 		return
 	}
@@ -223,23 +227,20 @@ func (kv *KVServer) snapshot() {
 		return
 	}
 
-	for !kv.killed() {
-		kv.mu.Lock()
-		if kv.maxraftstate <= kv.persister.RaftStateSize() {
-			snapshotStatus := &SnapshotStatus{
-				LastApplied: kv.lastApplied,
-				Data:        kv.data,
-				Duptable:    kv.duptable,
-			}
-			w := new(bytes.Buffer)
-			if err := labgob.NewEncoder(w).Encode(snapshotStatus); err != nil {
-				Debug(dError, "snapshot gob encode snapshotStatus err:%v", err)
-				return
-			}
-			kv.rf.Snapshot(kv.lastApplied, w.Bytes())
+	rate := float64(kv.persister.RaftStateSize()) / float64(kv.maxraftstate)
+	if rate >= 0.9 {
+		snapshotStatus := &SnapshotStatus{
+			LastApplied: kv.lastApplied,
+			Data:        kv.data,
+			Duptable:    kv.duptable,
 		}
-		kv.mu.Unlock()
-		time.Sleep(10 * time.Millisecond)
+
+		w := new(bytes.Buffer)
+		if err := labgob.NewEncoder(w).Encode(snapshotStatus); err != nil {
+			Debug(dError, "snapshot gob encode snapshotStatus err:%v", err)
+			return
+		}
+		kv.rf.Snapshot(snapshotStatus.LastApplied, w.Bytes())
 	}
 }
 
@@ -265,7 +266,10 @@ func (kv *KVServer) apply() {
 					kv.data[op.Key] = op.Value
 				case APPEND:
 					if _, ok := kv.data[op.Key]; ok {
-						kv.data[op.Key] = kv.data[op.Key] + op.Value
+						builder := strings.Builder{}
+						builder.WriteString(kv.data[op.Key])
+						builder.WriteString(op.Value)
+						kv.data[op.Key] = builder.String()
 					} else {
 						kv.data[op.Key] = op.Value
 					}
@@ -279,7 +283,8 @@ func (kv *KVServer) apply() {
 				ch <- term
 			}
 			Debug(dApply, "apply msg{%+v}", msg)
-			kv.lastApplied++
+			kv.lastApplied = msg.CommandIndex // 直接依赖底层raft的实现，不在应用层自己维护lastApplied
+			kv.snapshot()                     // 将定期快照和follower应用快照串行化处理
 		} else if msg.SnapshotValid /*follower使用快照重置状态机*/ {
 			snapshotStatus := &SnapshotStatus{}
 			if err := labgob.NewDecoder(bytes.NewBuffer(msg.Snapshot)).Decode(snapshotStatus); err != nil {
