@@ -42,9 +42,9 @@ type GetReply struct {
 }
 
 type SnapshotStatus struct {
-	LastApplied int
-	Data        map[string]string
-	Duptable    map[int64]int64
+	//LastApplied int
+	Data     map[string]string
+	Duptable map[int64]int64
 }
 
 type logTopic string
