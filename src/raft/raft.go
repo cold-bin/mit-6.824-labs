@@ -874,9 +874,12 @@ func (rf *Raft) findNextIndex(peer int, reply *AppendEntriesReply) {
 
 	ok := false
 	for i, entry := range rf.log { /*Case 2: leader has XTerm*/
+		if i == 0 /*skip 0 index*/ {
+			continue
+		}
 		if entry.Term == reply.XTerm {
 			ok = true
-			rf.nextIndex[peer] = rf.lastIncludedIndex + i
+			rf.nextIndex[peer] = rf.realIndex(i) + 1
 		}
 	}
 

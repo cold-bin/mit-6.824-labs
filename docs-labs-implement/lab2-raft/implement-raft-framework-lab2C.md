@@ -49,13 +49,18 @@ if reply.XTerm == -1 && reply.XIndex == -1 { /*Case 3: follower's log is too sho
     rf.nextIndex[peer] = reply.XLen
     return
 }
+
 ok := false
 for i, entry := range rf.log { /*Case 2: leader has XTerm*/
+    if i == 0 /*skip 0 index*/ {
+        continue
+    }
     if entry.Term == reply.XTerm {
         ok = true
-        rf.nextIndex[peer] = i
+        rf.nextIndex[peer] = rf.realIndex(i) + 1
     }
 }
+
 if !ok { /*Case 1: leader doesn't have XTerm*/
     rf.nextIndex[peer] = reply.XIndex
 }
