@@ -282,18 +282,18 @@ func (kv *KVServer) apply() {
 			if ch, ok := kv.wakeClient[index]; ok /*leader唤醒客户端reply*/ {
 				Debug(dClient, "S%d wakeup client", kv.me)
 				// 避免chan+mutex可能发生的死锁问题
-				//kv.mu.Unlock()
-				//func() /*退栈，确保recover捕获nil chan*/ {
-				//	defer func() {
-				//		if r := recover(); r != nil /*大概是客户端超时释放资源了*/ {
-				//			Debug(dInfo, "S%d close nil chan", kv.me)
-				//			return
-				//		}
-				//	}()
-				//	ch <- term
-				//}()
-				//kv.mu.Lock()
-				ch <- term
+				kv.mu.Unlock()
+				func() /*退栈，确保recover捕获nil chan*/ {
+					defer func() {
+						if r := recover(); r != nil /*大概是客户端超时释放资源了*/ {
+							Debug(dInfo, "S%d close nil chan", kv.me)
+							return
+						}
+					}()
+					ch <- term
+				}()
+				kv.mu.Lock()
+				//ch <- term
 			}
 
 			Debug(dApply, "apply msg{%+v}", msg)
