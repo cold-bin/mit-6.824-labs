@@ -250,53 +250,56 @@ func (kv *KVServer) snapshot() {
 // 应用状态机的时候，只需要应用Put/Append即可，Get不会对状态机造成任何影响
 func (kv *KVServer) apply() {
 	for msg := range kv.applyCh {
-
-		kv.mu.Lock()
-		if msg.CommandValid {
-			index := msg.CommandIndex
-			term := msg.CommandTerm
-			op := msg.Command.(Op)
-
-			if preSequenceId, ok := kv.duptable[op.ClientId]; ok &&
-				preSequenceId == op.SequenceId /*应用前需要再判一次重*/ {
-			} else /*没有重复，可以应用状态机并记录在table里*/ {
-				kv.duptable[op.ClientId] = op.SequenceId
-				switch op.Type {
-				case PUT:
-					kv.data[op.Key] = op.Value
-				case APPEND:
-					if _, ok := kv.data[op.Key]; ok {
-						builder := strings.Builder{}
-						builder.WriteString(kv.data[op.Key])
-						builder.WriteString(op.Value)
-						kv.data[op.Key] = builder.String()
-					} else {
-						kv.data[op.Key] = op.Value
-					}
-				case GET:
-					/*noting*/
+		func() {
+			kv.mu.Lock()
+			defer kv.mu.Unlock()
+			if msg.CommandValid {
+				if msg.CommandIndex <= kv.lastApplied /*出现这种情况，快照已经被加载了*/ {
+					return
 				}
-			}
+				index := msg.CommandIndex
+				term := msg.CommandTerm
+				op := msg.Command.(Op)
 
-			if ch, ok := kv.wakeClient[index]; ok /*leader唤醒客户端reply*/ {
-				Debug(dClient, "S%d wakeup client", kv.me)
-				ch <- term
-			}
-			Debug(dApply, "apply msg{%+v}", msg)
-			kv.lastApplied = msg.CommandIndex // 直接依赖底层raft的实现，不在应用层自己维护lastApplied
-			kv.snapshot()                     // 将定期快照和follower应用快照串行化处理
-		} else if msg.SnapshotValid /*follower使用快照重置状态机*/ {
-			snapshotStatus := &SnapshotStatus{}
-			if err := labgob.NewDecoder(bytes.NewBuffer(msg.Snapshot)).Decode(snapshotStatus); err != nil {
-				Debug(dError, "snapshot gob encode snapshotStatus err:%v", err)
-				return
-			}
-			kv.lastApplied = snapshotStatus.LastApplied
-			kv.data = snapshotStatus.Data
-			kv.duptable = snapshotStatus.Duptable
-			Debug(dSnap, "snapshot lastApplied:%d", snapshotStatus.LastApplied)
-		}
+				if preSequenceId, ok := kv.duptable[op.ClientId]; ok &&
+					preSequenceId == op.SequenceId /*应用前需要再判一次重*/ {
+				} else /*没有重复，可以应用状态机并记录在table里*/ {
+					kv.duptable[op.ClientId] = op.SequenceId
+					switch op.Type {
+					case PUT:
+						kv.data[op.Key] = op.Value
+					case APPEND:
+						if _, ok := kv.data[op.Key]; ok {
+							builder := strings.Builder{}
+							builder.WriteString(kv.data[op.Key])
+							builder.WriteString(op.Value)
+							kv.data[op.Key] = builder.String()
+						} else {
+							kv.data[op.Key] = op.Value
+						}
+					case GET:
+						/*noting*/
+					}
+				}
 
-		kv.mu.Unlock()
+				if ch, ok := kv.wakeClient[index]; ok /*leader唤醒客户端reply*/ {
+					Debug(dClient, "S%d wakeup client", kv.me)
+					ch <- term
+				}
+				Debug(dApply, "apply msg{%+v}", msg)
+				kv.lastApplied = msg.CommandIndex // 直接依赖底层raft的实现，不在应用层自己维护lastApplied
+				kv.snapshot()                     // 将定期快照和follower应用快照串行化处理
+			} else if msg.SnapshotValid /*follower使用快照重置状态机*/ {
+				snapshotStatus := &SnapshotStatus{}
+				if err := labgob.NewDecoder(bytes.NewBuffer(msg.Snapshot)).Decode(snapshotStatus); err != nil {
+					Debug(dError, "snapshot gob encode snapshotStatus err:%v", err)
+					return
+				}
+				kv.lastApplied = snapshotStatus.LastApplied
+				kv.data = snapshotStatus.Data
+				kv.duptable = snapshotStatus.Duptable
+				Debug(dSnap, "snapshot lastApplied:%d", snapshotStatus.LastApplied)
+			}
+		}()
 	}
 }
