@@ -279,10 +279,77 @@ leader接收到客户端的指令后，会把指令作为一个新的条目追�
 - 集群某节点断网一段时间后恢复网络，并且选举出新的leader时，集群中的新日志明明已经复制到了超过半数节点，但是还是无法提交日志。
 
   通过排查日志发现，重新选举过后，我是按照论文里的把所有节点的nextIndex和matchIndex重新初始化为`领导人最后的日志条目的索引+1`和`0`。但是，由于领导者`AppendEntries`RPC广播时，并不会对自己广播，所以只会去更新跟随者的nextIndex和matchIndex。所以，就导致了集群中节点matchIndex无法在commitIndex上达成大多数，所以就迟迟无法提交。而且，领导者持有最新日志，nextIndex和matchIndex应该初始化为`len(rf.log)`和`len(rf.log) - 1`
+  
+- `only 2 decided for index 6; wanted 3`表示在索引3处，只有两个server apply，还差一个server没有apply。
+
+  > 在做lab4A前大量测试测出来的bug
+
+  为什么会出现这种情况呢？思考在极端并发下，下面代码会出现什么情况
+
+  ```go
+  // 将已提交的日志应用到状态机里。
+  // 注意：防止日志被应用状态机之前被裁减掉，也就是说，一定要等日志被应用过后才能被裁减掉。
+  func (rf *Raft) applierEvent() {
+  	for rf.killed() == false {
+  		rf.mu.Lock()
+  		rf.cond.Wait() // 等待signal唤醒
+  		msgs := make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
+  		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+  			msgs = append(msgs, ApplyMsg{
+  				CommandValid: true,
+  				Command:      rf.log[rf.logIndex(i)].Command,
+  				CommandIndex: i,
+  				CommandTerm:  rf.log[rf.logIndex(i)].Term,
+  			})
+  			rf.lastApplied++
+  		}
+  		rf.mu.Unlock()
+  
+  		for _, msg := range msgs {
+  			rf.applyMsg <- msg
+  		}
+  	}
+  }
+  ```
+
+  上面的代码在极高并发下，会有这样一个bug：在我们唤醒等待并且释放锁过后，如果此时还有日志提交并调用`signal`那么这个时候会丢掉这次唤醒（唤醒失败），所以上面的写法在极高并发下是有问题的。因为必须在下一次唤醒才能把上一次丢掉的唤醒恢复。
+
+  解决方案：
+
+  - 不再使用applier协程。需要提交的时候直接调用apply及时应用日志，避免唤醒的丢失（不那么优雅
+  - 按照条件变量正确用法使用，可以避免丢失唤醒和虚假唤醒问题
+
+  ```go
+  // 将已提交的日志应用到状态机里。
+  // 注意：防止日志被应用状态机之前被裁减掉，也就是说，一定要等日志被应用过后才能被裁减掉。
+  func (rf *Raft) applierEvent() {
+  	for rf.killed() == false {
+  		rf.mu.Lock()
+  		for rf.commitIndex <= rf.lastApplied /*防止虚假唤醒*/ {
+  			rf.cond.Wait()
+  		}
+  		msgs := make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
+  		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+  			msgs = append(msgs, ApplyMsg{
+  				CommandValid: true,
+  				Command:      rf.log[rf.logIndex(i)].Command,
+  				CommandIndex: i,
+  				CommandTerm:  rf.log[rf.logIndex(i)].Term,
+  			})
+  			rf.lastApplied++
+  		}
+  		rf.mu.Unlock()
+  
+  		for _, msg := range msgs {
+  			rf.applyMsg <- msg
+  		}
+  	}
+  }
+  ```
 
 ### 结果
 
-脚本测试了100次
+脚本测试了3000次
 
 ```bash
 ➜  raft git:(main) VERBOSE=0 go test -race -run 2B
