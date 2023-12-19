@@ -191,7 +191,7 @@ func (rf *Raft) Role() string {
 // 选举后，领导人的易失状态需要重新初始化
 func (rf *Raft) initializeLeaderEasilyLostState() {
 	defer func() {
-		Debug(dLeader, "after S%d initializeLeaderEasilyLostState,nextIndex:%v,matchIndex:%v", rf.me, rf.nextIndex, rf.matchIndex)
+		Debug(dLeader, "S%d become new leader, nextIndex:%v,matchIndex:%v", rf.me, rf.nextIndex, rf.matchIndex)
 	}()
 
 	for i := 0; i < len(rf.peers); i++ {
@@ -207,7 +207,7 @@ func (rf *Raft) initializeLeaderEasilyLostState() {
 func (rf *Raft) changeRole(r role) {
 	preRole := rf.role
 	rf.role = r
-	Debug(dInfo, "S%d role %s->%s", rf.me, preRole.String(), r.String())
+	Debug(dInfo, "S%d %s->%s", rf.me, preRole.String(), r.String())
 }
 
 // Leader 获取leader, 没有就返回 NoLeader
@@ -323,13 +323,15 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		Debug(dSnap, "after Snapshot, S%d status{currentTerm:%d,commitIndex:%d,applied:%d,snapshotIndex:%d,lastIncludedIndex:%d,log_len:%d}",
 			rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied, index, rf.lastIncludedIndex, len(rf.log)-1)
 	}()
+	Debug(dSnap, "before Snapshot, S%d status{currentTerm:%d,commitIndex:%d,applied:%d,snapshotIndex:%d,lastIncludedIndex:%d,log_len:%d}",
+		rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied, index, rf.lastIncludedIndex, len(rf.log)-1)
 
-	if rf.lastApplied < index /*快照点超过应用点无效,必须等待日志被应用过后才能对其快照，防止应用日志前被裁减了*/ ||
-		rf.lastIncludedIndex >= index /*快照点如果小于前一次快照点，没有必要快照*/ {
+	if rf.lastIncludedIndex >= index /*快照点如果小于前一次快照点，没有必要快照*/ {
+		Debug(dSnap, "S%d snapshot fail: rf.lastApplied<index(%v) rf.lastIncludedIndex>=index(%v)",
+			rf.me, rf.lastApplied < index, rf.lastIncludedIndex >= index)
 		return
 	}
 
-	defer rf.persist()
 	// 丢弃被快照了的日志，同时修改其他状态
 	// last: snap{nil,1,2,3} {nil}
 	// now:  snap{nil,1,2,3,4,5} {nil,4,5}
@@ -337,6 +339,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.lastIncludedIndex = index
 	rf.log = append([]Logt{{Term: rf.log[split].Term}}, rf.log[split+1:]...)
 	rf.snapshot = snapshot
+	rf.persist()
 }
 
 type RequestVoteArgs struct {
@@ -358,9 +361,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer func() {
-		Debug(dVote, "after called RequestVote, S%d status{votedFor:%d,role:%s,currentTerm:%d}",
+		Debug(dVote, "after RequestVote, S%d status{votedFor:%d,role:%s,currentTerm:%d}",
 			rf.me, rf.votedFor, rf.role.String(), rf.currentTerm)
 	}()
+	Debug(dVote, "before RequestVote, S%d status{votedFor:%d,role:%s,currentTerm:%d}",
+		rf.me, rf.votedFor, rf.role.String(), rf.currentTerm)
 
 	if args.Term < rf.currentTerm { /*请求者任期较小，拒绝请求*/
 		reply.Term, reply.VoteGranted = rf.currentTerm, false
@@ -378,7 +383,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.isLogUpToDate(args.LastLogTerm, args.LastLogIndex) { /*日志至少和自己一样新，才能投票，否则不能投票*/
 		rf.votedFor = args.CandidateId
 		rf.electionTimer.Reset(withRandomElectionDuration())
-		Debug(dVote, "S%d vote to S%d, S%d election timer reset", rf.me, args.CandidateId, rf.me)
+		Debug(dVote, "S%d vote to S%d", rf.me, args.CandidateId)
 		reply.Term, reply.VoteGranted = rf.currentTerm, true
 		return
 	}
@@ -441,9 +446,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer func() {
-		Debug(dLog, "after AppendEntries,S%d -> S%d status{currentTerm:%d,role:%s,commitIndex:%d,applied:%d,lastIncludedIndex:%d,log_len:%d}",
-			rf.leader, rf.me, rf.currentTerm, rf.role.String(), rf.commitIndex, rf.lastApplied, rf.lastIncludedIndex, len(rf.log)-1)
+		Debug(dLog, "after AppendEntries, S%d status{currentTerm:%d,role:%s,commitIndex:%d,applied:%d,lastIncludedIndex:%d,log_len:%d}",
+			rf.me, rf.currentTerm, rf.role.String(), rf.commitIndex, rf.lastApplied, rf.lastIncludedIndex, len(rf.log)-1)
 	}()
+	Debug(dLog, "before AppendEntries, S%d status{currentTerm:%d,role:%s,commitIndex:%d,applied:%d,lastIncludedIndex:%d,log_len:%d}",
+		rf.me, rf.currentTerm, rf.role.String(), rf.commitIndex, rf.lastApplied, rf.lastIncludedIndex, len(rf.log)-1)
 
 	if args.Term < rf.currentTerm { /*请求的leader任期落后了，leader会变成follower，应该拒绝请求*/
 		reply.Term, reply.Success = rf.currentTerm, false
@@ -537,9 +544,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer func() {
-		Debug(dSnap, "after InstallSnapshot,S%d -> S%d status{currentTerm:%d,commitIndex:%d,applied:%d,lastIncludedIndex:%d,log_len:%d}",
-			rf.leader, rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.lastIncludedIndex, len(rf.log)-1)
+		Debug(dSnap, "after InstallSnapshot, S%d status{currentTerm:%d,commitIndex:%d,applied:%d,lastIncludedIndex:%d,log_len:%d}",
+			rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.lastIncludedIndex, len(rf.log)-1)
 	}()
+	Debug(dSnap, "before InstallSnapshot, S%d status{currentTerm:%d,commitIndex:%d,applied:%d,lastIncludedIndex:%d,log_len:%d}",
+		rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.lastIncludedIndex, len(rf.log)-1)
 
 	//1. 如果`term < currentTerm`就立即回复
 	if args.Term < rf.currentTerm /*请求的领导者过期了，不能安装过期leader的快照*/ {
@@ -556,6 +565,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.electionTimer.Reset(withRandomElectionDuration())
 
 	//5. 保存快照文件，丢弃具有较小索引的任何现有或部分快照
+	// 小于commitIndex一定小于lastIncludedIndex
 	if args.LastIncludedIndex <= rf.lastIncludedIndex /*raft快照点要先于leader时，无需快照*/ {
 		reply.Term = rf.currentTerm
 		return
@@ -568,11 +578,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	defer rf.persist()
 
-	rf.lastIncludedIndex = args.LastIncludedIndex
-	rf.log[0].Term = args.LastIncludedTerm
-	rf.commitIndex = args.LastIncludedIndex
-	rf.lastApplied = args.LastIncludedIndex
-	rf.snapshot = args.Data
+	//rf.commitIndex = args.LastIncludedIndex
+	//rf.lastApplied = args.LastIncludedIndex
+	//rf.snapshot = args.Data
 	msg := ApplyMsg{
 		SnapshotValid: true,
 		Snapshot:      args.Data,
@@ -583,6 +591,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	for i := 1; i < len(rf.log); i++ {
 		if rf.realIndex(i) == args.LastIncludedIndex && rf.log[i].Term == args.LastIncludedTerm {
 			rf.log = append([]Logt{{Term: args.LastIncludedTerm}}, rf.log[i+1:]...)
+			rf.lastIncludedIndex = args.LastIncludedIndex
+			rf.commitIndex = args.LastIncludedIndex
+			rf.lastApplied = args.LastIncludedIndex
+			rf.snapshot = args.Data
 			go func() {
 				rf.applyMsg <- msg
 			}()
@@ -593,6 +605,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	//7. 丢弃整个日志（因为整个log都是过期的）
 	rf.log = []Logt{{Term: args.LastIncludedTerm}}
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.commitIndex = args.LastIncludedIndex
+	rf.lastApplied = args.LastIncludedIndex
+	rf.snapshot = args.Data
 	//8. 使用快照重置状态机（并加载快照的集群配置）
 	go func() {
 		rf.applyMsg <- msg
@@ -646,7 +662,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.replicateSignal <- struct{}{}
 	}()
 
-	Debug(dLog, "S%d Start cmd:%v,index:%d", rf.me, command, index)
+	Debug(dClient, "S%d Start cmd:%v,index:%d", rf.me, command, index)
 	return index, term, isLeader
 }
 
@@ -717,6 +733,9 @@ func (rf *Raft) applierEvent() {
 		for rf.commitIndex <= rf.lastApplied /*防止虚假唤醒*/ {
 			rf.cond.Wait()
 		}
+
+		//lastApplied := rf.lastApplied
+		commitIndex := rf.commitIndex
 		msgs := make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			msgs = append(msgs, ApplyMsg{
@@ -725,13 +744,21 @@ func (rf *Raft) applierEvent() {
 				CommandIndex: i,
 				CommandTerm:  rf.log[rf.logIndex(i)].Term,
 			})
-			rf.lastApplied++
 		}
+		Debug(dLog2, "S%d lastApplied:%d", rf.me, rf.lastApplied)
 		rf.mu.Unlock()
 
+		// msgs这里会发生msgs的截断，导致没有
+		Debug(dLog2, "S%d need apply msg{%+v}", rf.me, msgs)
 		for _, msg := range msgs {
 			rf.applyMsg <- msg
+			Debug(dLog2, "S%d apply index:%d", rf.me, msg.CommandIndex)
 		}
+
+		// 必须等待真的apply到管道里才更新lastApplied
+		rf.mu.Lock()
+		rf.lastApplied = max(commitIndex, rf.lastApplied)
+		rf.mu.Unlock()
 	}
 }
 
@@ -744,9 +771,6 @@ func (rf *Raft) heartbeatBroadcast() {
 			continue
 		}
 
-		Debug(dLog, "heartbeatBroadcast S%d{lastIncludedIndex:%d} -> S%d{nextIndex:%d}",
-			rf.me, rf.lastIncludedIndex, peer, rf.nextIndex[peer])
-
 		if rf.nextIndex[peer] <= rf.lastIncludedIndex /*存在于快照中，发送安装快照RPC*/ {
 			args := &InstallSnapshotArgs{
 				Term:              rf.currentTerm,
@@ -756,7 +780,7 @@ func (rf *Raft) heartbeatBroadcast() {
 				Data:              rf.snapshot,
 			}
 
-			Debug(dLog, `sendInstallSnapshot S%d -> S%d, LastIncludedIndex:%d,LastIncludedTerm:%d`,
+			Debug(dSnap, `sendInstallSnapshot S%d -> S%d, args{LastIncludedIndex:%d,LastIncludedTerm:%d}`,
 				rf.me, peer, args.LastIncludedIndex, args.LastIncludedTerm)
 
 			go rf.handleSendInstallSnapshot(peer, args)
@@ -778,8 +802,8 @@ func (rf *Raft) heartbeatBroadcast() {
 			//deep copy
 			args.Entries = append(args.Entries, rf.log[rf.logIndex(rf.nextIndex[peer]):]...)
 
-			Debug(dLog, `sendAppendEntries S%d -> S%d, lastIncludedIndex:%d args{PrevLogIndex:%d,PrevLogTerm:%d,LeaderCommit:%d,log_entries_len:%d"}`,
-				rf.me, peer, rf.lastIncludedIndex, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, len(args.Entries))
+			Debug(dLog, `sendAppendEntries S%d -> S%d, args{PrevLogIndex:%d,PrevLogTerm:%d,LeaderCommit:%d,entries_len:%d}`,
+				rf.me, peer, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, len(args.Entries))
 
 			go rf.handleSendAppendEntries(peer, args)
 		}
@@ -792,7 +816,7 @@ func (rf *Raft) handleSendAppendEntries(peer int, args *AppendEntriesArgs) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 		defer func() {
-			Debug(dLog, `after sendAppendEntries S%d, nextIndex:%d matchIndex:%d`, peer, rf.nextIndex[peer], rf.matchIndex[peer])
+			Debug(dLog, `sendAppendEntries S%d's reply, nextIndex:%d matchIndex:%d`, peer, rf.nextIndex[peer], rf.matchIndex[peer])
 		}()
 
 		if rf.currentTerm != args.Term || rf.role != leader { /*不是leader，没有必要在进行广播*/
@@ -808,8 +832,9 @@ func (rf *Raft) handleSendAppendEntries(peer int, args *AppendEntriesArgs) {
 		}
 
 		if reply.Success { /*心跳成功或日志复制成功*/
-			rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
-			rf.nextIndex[peer] = args.PrevLogIndex + len(args.Entries) + 1
+			// 可能快照和日志复制reply同一时间到达，需要取两者的最大值
+			rf.matchIndex[peer] = max(rf.matchIndex[peer], args.PrevLogIndex+len(args.Entries))
+			rf.nextIndex[peer] = max(rf.nextIndex[peer], args.PrevLogIndex+len(args.Entries)+1)
 			/*超过半数节点追加成功，也就是已提交，并且还是leader，那么就可以应用当前任期里的日志到状态机里。找到共识N：遍历对等点，找到相同的N*/
 			rf.checkAndCommitLogs()
 		} else {
@@ -825,7 +850,7 @@ func (rf *Raft) handleSendInstallSnapshot(peer int, args *InstallSnapshotArgs) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 		defer func() {
-			Debug(dLog, `after sendInstallSnapshot S%d status{nextIndex:%d,matchIndex:%d,LastIncludedIndex:%d,LastIncludedTerm:%d}`,
+			Debug(dSnap, `sendInstallSnapshot S%d's reply, status{nextIndex:%d,matchIndex:%d,LastIncludedIndex:%d,LastIncludedTerm:%d}`,
 				peer, rf.nextIndex[peer], rf.matchIndex[peer], rf.lastIncludedIndex, rf.log[0].Term)
 		}()
 
@@ -841,18 +866,19 @@ func (rf *Raft) handleSendInstallSnapshot(peer int, args *InstallSnapshotArgs) {
 			return
 		}
 
-		rf.nextIndex[peer] = args.LastIncludedIndex + 1
-		rf.matchIndex[peer] = args.LastIncludedIndex
+		// 可能快照和日志复制reply同一时间到达，需要取两者的最大值
+		rf.matchIndex[peer] = max(rf.matchIndex[peer], args.LastIncludedIndex)
+		rf.nextIndex[peer] = max(rf.nextIndex[peer], args.LastIncludedIndex+1)
 	}
 }
 
 func (rf *Raft) checkAndCommitLogs() {
 	n := len(rf.peers)
 	N := rf.commitIndex
-	for _N := rf.commitIndex + 1; _N < rf.lastIncludedIndex+len(rf.log); _N++ {
+	for _N := rf.commitIndex + 1; _N < rf.realLogLen(); _N++ {
 		succeedNum := 0
 		for peer := 0; peer < n; peer++ {
-			if _N <= rf.matchIndex[peer] && rf.log[_N-rf.lastIncludedIndex].Term == rf.currentTerm {
+			if _N <= rf.matchIndex[peer] && rf.log[rf.logIndex(_N)].Term == rf.currentTerm {
 				succeedNum++
 			}
 		}
@@ -898,7 +924,7 @@ func (rf *Raft) startElection() {
 	rf.persist()
 	approvedNum := 1 // 先给自己投一票
 	rf.electionTimer.Reset(withRandomElectionDuration())
-	Debug(dTimer, "S%d start election, S%d reset election timer", rf.me, rf.me)
+	Debug(dTimer, "S%d start election", rf.me)
 	n := len(rf.peers)
 
 	// 向其他对等点并发发送投票请求
@@ -912,6 +938,7 @@ func (rf *Raft) startElection() {
 			LastLogIndex: rf.lastLogIndex(),
 			LastLogTerm:  rf.lastLogTerm(),
 		}
+		Debug(dVote, "sendRequestVote S%d -> S%d, args{%+v}", rf.me, i, args)
 		go func(peer int) {
 			reply := new(RequestVoteReply)
 			if ok := rf.sendRequestVote(peer, args, reply); !ok {
@@ -920,6 +947,13 @@ func (rf *Raft) startElection() {
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
+			defer func() {
+				Debug(dVote, "sendRequestVote S%d's reply, grant %v at term: %d", peer, reply.VoteGranted, reply.Term)
+			}()
+
+			if rf.currentTerm != args.Term || rf.role != candidate /*提前结束*/ {
+				return
+			}
 
 			if reply.Term > rf.currentTerm {
 				rf.currentTerm, rf.votedFor = reply.Term, noVote
@@ -953,14 +987,13 @@ func (rf *Raft) startElection() {
 func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 	n := len(peers)
 	rf := &Raft{
-		peers:     peers,
-		persister: persister,
-		me:        me,
-		dead:      0,
-		role:      follower,
-		leader:    NoLeader,
-		applyMsg:  applyCh,
-		//cond:              sync.NewCond(&sync.Mutex{}),
+		peers:             peers,
+		persister:         persister,
+		me:                me,
+		dead:              0,
+		role:              follower,
+		leader:            NoLeader,
+		applyMsg:          applyCh,
 		currentTerm:       0,
 		votedFor:          noVote,
 		log:               make([]Logt, 1),

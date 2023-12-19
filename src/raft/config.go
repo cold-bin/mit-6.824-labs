@@ -221,14 +221,21 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 		err_msg := ""
 		if m.SnapshotValid {
 			cfg.mu.Lock()
+			Debug(dTest, "S%d install snapshot snapshotIndex:%d\n", rf.me, m.SnapshotIndex)
 			err_msg = cfg.ingestSnap(i, m.Snapshot, m.SnapshotIndex)
 			cfg.mu.Unlock()
 		} else if m.CommandValid {
+			Debug(dTest, "S%d apply log m.CommandIndex:%d expect:%d\n", rf.me, m.CommandIndex, cfg.lastApplied[i]+1)
 			if m.CommandIndex != cfg.lastApplied[i]+1 {
+				// 23 			29+1
+				// 这个lastApplied跑到了前面
 				err_msg = fmt.Sprintf("server %v apply out of order, expected index %v, got %v", i, cfg.lastApplied[i]+1, m.CommandIndex)
+
 				cfg.mu.Lock()
-				fmt.Printf("lastIncludedIndex:%d,lastApplied:%d,commitIndex:%d\n",
-					rf.lastIncludedIndex, rf.lastApplied, rf.commitIndex)
+				for i, v := range cfg.logs {
+					fmt.Printf("S%d:%+v\n", i, v)
+				}
+				fmt.Printf("%+v\n", m)
 				cfg.mu.Unlock()
 			}
 
