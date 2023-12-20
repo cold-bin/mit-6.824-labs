@@ -27,17 +27,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer func() {
-		Debug(dSnap, "after Snapshot, S%d status{currentTerm:%d,commitIndex:%d,applied:%d,snapshotIndex:%d,lastIncludedIndex:%d,log_len:%d}",
-			rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied, index, rf.lastIncludedIndex, len(rf.log)-1)
-	}()
 
-	if rf.lastApplied < index /*快照点超过应用点无效,必须等待日志被应用过后才能对其快照，防止应用日志前被裁减了*/ ||
+	if rf.commitIndex < index /*commit过后才能快照*/ ||
 		rf.lastIncludedIndex >= index /*快照点如果小于前一次快照点，没有必要快照*/ {
 		return
 	}
 
-	defer rf.persist()
 	// 丢弃被快照了的日志，同时修改其他状态
 	// last: snap{nil,1,2,3} {nil}
 	// now:  snap{nil,1,2,3,4,5} {nil,4,5}
@@ -45,9 +40,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.lastIncludedIndex = index
 	rf.log = append([]Logt{{Term: rf.log[split].Term}}, rf.log[split+1:]...)
 	rf.snapshot = snapshot
+	rf.persist()
 }
-
 ```
+
+> 我在后面修改lab2D bug时，修改了`applier`的实现，所以这里需要把`rf.lastApplied < index`修改为`rf.commitIndex < index`
 
 #### 实现`InstallSnapshot()`方法
 
@@ -76,28 +73,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 - leader安装快照的过程请求了对等点, 算是一次ping/pong, 可以刷新选举计时器以及重新置为follower
 - 如果对等点任期落后, 那么依然可以继续后面的步骤, 但是需要重置旧任期的选票和更新任期
 - 使用Copy-on-Write的技术优化
+- 注意`lastIncludedIndex`一定要在使用旧的`lastIncludedIndex`过后更新
 
 ```go
-// 不分片
-type InstallSnapshotArgs struct {
-	Term              int    // 领导人的任期号
-	LeaderId          int    // 领导人的 ID，以便于跟随者重定向请求
-	LastIncludedIndex int    // 快照中包含的最后日志条目的索引值
-	LastIncludedTerm  int    // 快照中包含的最后日志条目的任期号
-	Data              []byte // 从偏移量开始的快照分块的原始字节
-}
-
-type InstallSnapshotReply struct {
-	Term int // 当前任期号（currentTerm），便于领导人更新自己
-}
-
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer func() {
-		Debug(dSnap, "after InstallSnapshot, S%d status{currentTerm:%d,commitIndex:%d,applied:%d,lastIncludedIndex:%d,log_len:%d}",
-			rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.lastIncludedIndex, len(rf.log)-1)
-	}()
 
 	//1. 如果`term < currentTerm`就立即回复
 	if args.Term < rf.currentTerm /*请求的领导者过期了，不能安装过期leader的快照*/ {
@@ -108,23 +89,25 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.Term > rf.currentTerm /*当前raft落后，可以接着安装快照*/ {
 		rf.currentTerm, rf.votedFor = args.Term, noVote
 	}
+	rf.leader = args.LeaderId
 
 	rf.changeRole(follower)
 	rf.electionTimer.Reset(withRandomElectionDuration())
 
 	//5. 保存快照文件，丢弃具有较小索引的任何现有或部分快照
+	// 小于commitIndex一定小于lastIncludedIndex
 	if args.LastIncludedIndex <= rf.lastIncludedIndex /*raft快照点要先于leader时，无需快照*/ {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	if args.LastIncludedIndex <= rf.commitIndex /*leader快照点小于当前提交点*/ {
 		reply.Term = rf.currentTerm
 		return
 	}
 
 	defer rf.persist()
 
-	rf.lastIncludedIndex = args.LastIncludedIndex
-	rf.log[0].Term = args.LastIncludedTerm
-	rf.commitIndex = args.LastIncludedIndex
-	rf.lastApplied = args.LastIncludedIndex
-	rf.snapshot = args.Data
 	msg := ApplyMsg{
 		SnapshotValid: true,
 		Snapshot:      args.Data,
@@ -135,6 +118,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	for i := 1; i < len(rf.log); i++ {
 		if rf.realIndex(i) == args.LastIncludedIndex && rf.log[i].Term == args.LastIncludedTerm {
 			rf.log = append([]Logt{{Term: args.LastIncludedTerm}}, rf.log[i+1:]...)
+			rf.lastIncludedIndex = args.LastIncludedIndex
+			rf.commitIndex = args.LastIncludedIndex
+			rf.lastApplied = args.LastIncludedIndex
+			rf.snapshot = args.Data
 			go func() {
 				rf.applyMsg <- msg
 			}()
@@ -145,6 +132,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	//7. 丢弃整个日志（因为整个log都是过期的）
 	rf.log = []Logt{{Term: args.LastIncludedTerm}}
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.commitIndex = args.LastIncludedIndex
+	rf.lastApplied = args.LastIncludedIndex
+	rf.snapshot = args.Data
 	//8. 使用快照重置状态机（并加载快照的集群配置）
 	go func() {
 		rf.applyMsg <- msg
@@ -172,10 +163,7 @@ if rf.nextIndex[peer] <= rf.lastIncludedIndex /*存在于快照中，发送安�
         LastIncludedTerm:  rf.log[0].Term,
         Data:              rf.snapshot,
     }
-
-    Debug(dLog, `sendInstallSnapshot S%d -> S%d, LastIncludedIndex:%d,LastIncludedTerm:%d`,
-        rf.me, peer, args.LastIncludedIndex, args.LastIncludedTerm)
-
+    
     go rf.handleSendInstallSnapshot(peer, args)
 } else /*存在于未裁减的log中，发起日志复制rpc*/ {
     args := &AppendEntriesArgs{
@@ -195,9 +183,6 @@ if rf.nextIndex[peer] <= rf.lastIncludedIndex /*存在于快照中，发送安�
     //deep copy
     args.Entries = append(args.Entries, rf.log[rf.logIndex(rf.nextIndex[peer]):]...)
 
-    Debug(dLog, `sendAppendEntries S%d -> S%d, lastIncludedIndex:%d args{PrevLogIndex:%d,PrevLogTerm:%d,LeaderCommit:%d,log_entries_len:%d"}`,
-        rf.me, peer, rf.lastIncludedIndex, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, len(args.Entries))
-
     go rf.handleSendAppendEntries(peer, args)
 }
 
@@ -213,15 +198,9 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	defer func() {
-		Debug(dPersist, "after read persist, S%d recover to status{currentTerm:%d,commitIndex:%d,applied:%d,lastIncludedIndex:%d,log_len:%d}",
-			rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.lastIncludedIndex, len(rf.log)-1)
-	}()
-
 	// Your code here (2C).
 	persistentStatus := &PersistentStatus{}
 	if err := labgob.NewDecoder(bytes.NewBuffer(data)).Decode(persistentStatus); err != nil {
-		Debug(dError, "readPersist decode err:%v", err)
 		return
 	}
 
@@ -240,7 +219,69 @@ func (rf *Raft) readPersist(data []byte) {
 }
 ```
 
+#### 修改`applier`方法以兼容快照
 
+```go
+func (rf *Raft) applierEvent() {
+	for rf.killed() == false {
+		rf.mu.Lock()
+		for rf.commitIndex <= rf.lastApplied /*防止虚假唤醒*/ {
+			rf.cond.Wait()
+		}
+
+		lastApplied := rf.lastApplied
+		msgs := make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
+		for i := rf.lastApplied + 1; i <= rf.commitIndex && i > rf.lastIncludedIndex; i++ {
+			msgs = append(msgs, ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.logIndex(i)].Command,
+				CommandIndex: i,
+				CommandTerm:  rf.log[rf.logIndex(i)].Term,
+			})
+		}
+		rf.mu.Unlock()
+
+		for _, msg := range msgs {
+			rf.mu.Lock()
+			if msg.CommandIndex != rf.lastApplied+1 /*下一个apply的log一定是lastApplied+1*/ {
+				rf.mu.Unlock()
+				continue
+			}
+			rf.mu.Unlock()
+
+			rf.applyMsg <- msg
+
+			rf.mu.Lock()
+			lastApplied++
+			rf.lastApplied = max(lastApplied, rf.lastApplied)
+			rf.mu.Unlock()
+		}
+	}
+}
+```
+
+主要是改动了两个点：
+
+- `lastApplied`的更新放到apply管道后面，且每apply一个log便及时更新`lastApplied`。
+- 真正apply到管道前一定要先判断当前log是否合理
+
+#### 修改`nextIndext`和`matchIndex`更新方法兼容快照
+
+主要是考虑到可能存在leader可能会发送日志复制和安装快照给同一个follower（极端并发），这个时候不能再采取原来的直接覆盖方案，应该取最大值。
+
+日志复制reply的`nextIndex`和`matchIndex`处理
+
+```go
+rf.matchIndex[peer] = max(rf.matchIndex[peer], args.PrevLogIndex+len(args.Entries))
+rf.nextIndex[peer] = max(rf.nextIndex[peer], args.PrevLogIndex+len(args.Entries)+1)
+```
+
+安装快照reply的`nextIndex`和`matchIndex`处理
+
+```go
+rf.matchIndex[peer] = max(rf.matchIndex[peer], args.LastIncludedIndex)
+rf.nextIndex[peer] = max(rf.nextIndex[peer], args.LastIncludedIndex+1)
+```
 
 ### 调试过程
 
@@ -408,6 +449,85 @@ if rf.lastIncludedIndex > args.PrevLogIndex /*对等点的快照点已经超过�
     return
 }
 ```
+
+#### 调试`server x apply out of order, expected index a, got b`
+
+偶尔会出现这样的问题，查看日志发现这个怪现象：安装快照RPC成功，但是本来应该保留`lastIncludedIndex`后面的log的，但却被直接删除了。主要是我是先修改的`lastIncludedIndex`，所以代码后面的日志是否保留的判断就提前失效了。所以把`lastIncludedIndex`的修改放到使用完过后再修改。但是修改完毕过后，还是会出现这个问题。
+
+后面又搜了很多网上的，都存在问题，估计是他们写的时候测试没有上千次，有些是`cond`使用有丢失唤醒的问题，有的是`lastApplied`还没有apply到管道里就更新了，还有的`lastIncludedIndex`提前更新覆盖了以前的`lastIncludedIndex`导致有些封装好的下标获取函数获取错误的下标。
+
+> 艹，这些人都不测试上百上千次就发出来了，纯属误人子弟。
+
+后面仔细看了代码，发现我的`applier`实现的有点问题，下面是原来的实现
+
+```go
+func (rf *Raft) applier() {
+	for rf.killed() == false {
+		rf.conds[rf.me].L.Lock()
+		rf.conds[rf.me].Wait()
+		rf.conds[rf.me].L.Unlock()
+
+		rf.mu.Lock()
+		msgs := make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			msgs = append(msgs, ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.logIndex(i)].Command,
+				CommandIndex: i,
+			})
+            rf.lastApplied++
+		}
+		rf.mu.Unlock()
+
+		for _, msg := range msgs {
+			rf.applyMsg <- msg
+		}
+	}
+}
+```
+
+上面的代码，我在日志中发现了这么一个现象：获得`msgs`过后，快照又接着安装好了，导致原来的`msgs`中有些`msg`的`index`是过期的，不能在apply管道里了，因为这些已经被安装快照过了，apply管道里的msg过期了。而且，也有可能`msgs`中的`msg`超前了，所以这里做出了严格限制：apply的`msg`一定是**当前`lastApplied+1`**，如果不是的话，说明不满足要求。
+
+```go
+func (rf *Raft) applierEvent() {
+	for rf.killed() == false {
+		rf.mu.Lock()
+		for rf.commitIndex <= rf.lastApplied /*防止虚假唤醒*/ {
+			rf.cond.Wait()
+		}
+
+		lastApplied := rf.lastApplied
+		msgs := make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
+		for i := rf.lastApplied + 1; i <= rf.commitIndex && i > rf.lastIncludedIndex; i++ {
+			msgs = append(msgs, ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.logIndex(i)].Command,
+				CommandIndex: i,
+				CommandTerm:  rf.log[rf.logIndex(i)].Term,
+			})
+		}
+		rf.mu.Unlock()
+        
+		for _, msg := range msgs {
+			rf.mu.Lock()
+			if msg.CommandIndex != rf.lastApplied+1 /*下一个apply的log一定是lastApplied+1*/ {
+				rf.mu.Unlock()
+				continue
+			}
+			rf.mu.Unlock()
+
+			rf.applyMsg <- msg
+
+			rf.mu.Lock()
+			lastApplied++
+			rf.lastApplied = max(lastApplied, rf.lastApplied)
+			rf.mu.Unlock()
+		}
+	}
+}
+```
+
+> 但好像还是有问题，几百次会有已两次fail，暂时不管了。多线程编程真的太难调试了，某些地方很难从现象倒推出原因。
 
 ### 结果
 
