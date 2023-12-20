@@ -326,7 +326,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	Debug(dSnap, "before Snapshot, S%d status{currentTerm:%d,commitIndex:%d,applied:%d,snapshotIndex:%d,lastIncludedIndex:%d,log_len:%d}",
 		rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied, index, rf.lastIncludedIndex, len(rf.log)-1)
 
-	if rf.lastIncludedIndex >= index /*快照点如果小于前一次快照点，没有必要快照*/ {
+	if rf.commitIndex < index /*commit过后才能快照*/ ||
+		rf.lastIncludedIndex >= index /*快照点如果小于前一次快照点，没有必要快照*/ {
 		Debug(dSnap, "S%d snapshot fail: rf.lastApplied<index(%v) rf.lastIncludedIndex>=index(%v)",
 			rf.me, rf.lastApplied < index, rf.lastIncludedIndex >= index)
 		return
@@ -578,9 +579,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	defer rf.persist()
 
-	//rf.commitIndex = args.LastIncludedIndex
-	//rf.lastApplied = args.LastIncludedIndex
-	//rf.snapshot = args.Data
 	msg := ApplyMsg{
 		SnapshotValid: true,
 		Snapshot:      args.Data,
@@ -734,8 +732,7 @@ func (rf *Raft) applierEvent() {
 			rf.cond.Wait()
 		}
 
-		//lastApplied := rf.lastApplied
-		commitIndex := rf.commitIndex
+		lastApplied := rf.lastApplied
 		msgs := make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			msgs = append(msgs, ApplyMsg{
@@ -745,20 +742,25 @@ func (rf *Raft) applierEvent() {
 				CommandTerm:  rf.log[rf.logIndex(i)].Term,
 			})
 		}
-		Debug(dLog2, "S%d lastApplied:%d", rf.me, rf.lastApplied)
 		rf.mu.Unlock()
 
-		// msgs这里会发生msgs的截断，导致没有
 		Debug(dLog2, "S%d need apply msg{%+v}", rf.me, msgs)
 		for _, msg := range msgs {
-			rf.applyMsg <- msg
-			Debug(dLog2, "S%d apply index:%d", rf.me, msg.CommandIndex)
-		}
+			rf.mu.Lock()
+			if msg.CommandIndex != rf.lastApplied+1 /*下一个apply的log一定是lastApplied+1*/ {
+				rf.mu.Unlock()
+				continue
+			}
+			rf.mu.Unlock()
 
-		// 必须等待真的apply到管道里才更新lastApplied
-		rf.mu.Lock()
-		rf.lastApplied = max(commitIndex, rf.lastApplied)
-		rf.mu.Unlock()
+			rf.applyMsg <- msg
+
+			rf.mu.Lock()
+			lastApplied++
+			rf.lastApplied = max(lastApplied, rf.lastApplied)
+			Debug(dLog2, "S%d lastApplied:%d", rf.me, rf.lastApplied)
+			rf.mu.Unlock()
+		}
 	}
 }
 
@@ -902,12 +904,9 @@ func (rf *Raft) findNextIndex(peer int, reply *AppendEntriesReply) {
 
 	ok := false
 	for i, entry := range rf.log { /*Case 2: leader has XTerm*/
-		if i == 0 /*skip 0 index*/ {
-			continue
-		}
 		if entry.Term == reply.XTerm {
 			ok = true
-			rf.nextIndex[peer] = rf.realIndex(i) + 1
+			rf.nextIndex[peer] = rf.realIndex(i)
 		}
 	}
 
