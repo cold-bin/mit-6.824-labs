@@ -19,3 +19,5 @@
 - [lab3B-有快照kv](docs-labs-implement/lab3-fault-tolerant-kvstore/implement-fault-tolerant-kvstore-lab3B.md)
 
 ## lab4 sharded-kvstore
+
+- [lab4A-分片控制器](docs-labs-implement/lab4-sharded-kvstore/implement-sharded-kvstore-lab4A.md)
