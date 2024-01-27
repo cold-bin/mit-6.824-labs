@@ -10,8 +10,9 @@ import "crypto/rand"
 import "math/big"
 
 type Clerk struct {
-	servers []*labrpc.ClientEnd
-	// Your data here.
+	servers    []*labrpc.ClientEnd
+	clientId   int64 // 标识客户端
+	sequenceId int64 // 表示相同客户端发起的不同rpc. 重复rpc具有相同的此项值
 }
 
 func nrand() int64 {
@@ -22,16 +23,25 @@ func nrand() int64 {
 }
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
-	ck := new(Clerk)
-	ck.servers = servers
-	// Your code here.
-	return ck
+	return &Clerk{
+		servers:    servers,
+		clientId:   nrand(),
+		sequenceId: 0,
+	}
 }
 
 func (ck *Clerk) Query(num int) Config {
-	args := &QueryArgs{}
-	// Your code here.
-	args.Num = num
+	defer func() {
+		Debug(dGet, "", ck.clientId, ck.sequenceId)
+	}()
+
+	args := &QueryArgs{
+		Num:        num,
+		ClientId:   ck.clientId,
+		SequenceId: ck.sequenceId,
+	}
+	ck.sequenceId++
+
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
@@ -46,9 +56,12 @@ func (ck *Clerk) Query(num int) Config {
 }
 
 func (ck *Clerk) Join(servers map[int][]string) {
-	args := &JoinArgs{}
-	// Your code here.
-	args.Servers = servers
+	args := &JoinArgs{
+		Servers:    servers,
+		ClientId:   ck.clientId,
+		SequenceId: ck.sequenceId,
+	}
+	ck.sequenceId++
 
 	for {
 		// try each known server.
@@ -64,9 +77,12 @@ func (ck *Clerk) Join(servers map[int][]string) {
 }
 
 func (ck *Clerk) Leave(gids []int) {
-	args := &LeaveArgs{}
-	// Your code here.
-	args.GIDs = gids
+	args := &LeaveArgs{
+		GIDs:       gids,
+		ClientId:   ck.clientId,
+		SequenceId: ck.sequenceId,
+	}
+	ck.sequenceId++
 
 	for {
 		// try each known server.
@@ -82,10 +98,13 @@ func (ck *Clerk) Leave(gids []int) {
 }
 
 func (ck *Clerk) Move(shard int, gid int) {
-	args := &MoveArgs{}
-	// Your code here.
-	args.Shard = shard
-	args.GID = gid
+	args := &MoveArgs{
+		Shard:      shard,
+		GID:        gid,
+		ClientId:   ck.clientId,
+		SequenceId: ck.sequenceId,
+	}
+	ck.sequenceId++
 
 	for {
 		// try each known server.
