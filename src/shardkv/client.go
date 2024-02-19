@@ -46,7 +46,7 @@ type Clerk struct {
 // ctrlers[] is needed to call shardctrler.MakeClerk().
 //
 // make_end(servername) turns a server name from a
-// UpConfig.Groups[gid][i] into a labrpc.ClientEnd on which you can
+// UpgradeCfg.Groups[gid][i] into a labrpc.ClientEnd on which you can
 // send RPCs.
 func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)

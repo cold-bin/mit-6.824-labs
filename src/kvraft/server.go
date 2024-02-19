@@ -65,8 +65,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	kv.mu.Lock()
-	ch := make(chan int)
-	kv.wakeClient[index] = ch
+	ch := kv.waitCh(index)
 	kv.mu.Unlock()
 
 	// 延迟释放资源
@@ -279,22 +278,26 @@ func (kv *KVServer) apply() {
 				}
 			}
 
-			if ch, ok := kv.wakeClient[index]; ok /*leader唤醒客户端reply*/ {
-				Debug(dClient, "S%d wakeup client", kv.me)
-				// 避免chan+mutex可能发生的死锁问题
-				kv.mu.Unlock()
-				func() /*退栈，确保recover捕获nil chan*/ {
-					defer func() {
-						if r := recover(); r != nil /*大概是客户端超时释放资源了*/ {
-							Debug(dInfo, "S%d close nil chan", kv.me)
-							return
-						}
-					}()
-					ch <- term
-				}()
-				kv.mu.Lock()
-				//ch <- term
-			}
+			ch := kv.waitCh(index)
+			kv.mu.Unlock()
+			ch <- term
+			kv.mu.Lock()
+			//if ch, ok := kv.wakeClient[index]; ok /*leader唤醒客户端reply*/ {
+			//	Debug(dClient, "S%d wakeup client", kv.me)
+			//	// 避免chan+mutex可能发生的死锁问题
+			//	kv.mu.Unlock()
+			//	func() /*退栈，确保recover捕获nil chan*/ {
+			//		defer func() {
+			//			if r := recover(); r != nil /*大概是客户端超时释放资源了*/ {
+			//				Debug(dInfo, "S%d close nil chan", kv.me)
+			//				return
+			//			}
+			//		}()
+			//		ch <- term
+			//	}()
+			//	kv.mu.Lock()
+			//	//ch <- term
+			//}
 
 			Debug(dApply, "apply msg{%+v}", msg)
 			kv.lastApplied = index // 直接依赖底层raft的实现，不在应用层自己维护lastApplied
@@ -313,4 +316,12 @@ func (kv *KVServer) apply() {
 		}
 		kv.mu.Unlock()
 	}
+}
+func (kv *KVServer) waitCh(index int) chan int {
+	ch, exist := kv.wakeClient[index]
+	if !exist {
+		kv.wakeClient[index] = make(chan int, 1)
+		ch = kv.wakeClient[index]
+	}
+	return ch
 }

@@ -39,12 +39,12 @@ type Op struct {
 	Value string
 
 	// for config
-	UpConfig shardctrler.Config
+	UpgradeCfg shardctrler.Config
 
 	// for shard remove/add
 	ShardId  int
 	Shard    Shard
-	Duptable map[int64]int
+	Duptable map[int64]int // only for shard add
 }
 
 // OpReply is used to wake waiting RPC caller after Op arrived from applyCh
@@ -149,7 +149,7 @@ func (kv *ShardKV) AddShard(args *SendShardArg, reply *AddShardReply) {
 		SequenceId: args.SequenceId,
 		ShardId:    args.ShardId,
 		Shard:      args.Shard,
-		Duptable:   args.LastAppliedSequenceId,
+		Duptable:   args.Duptable,
 	}
 
 	reply.Err = kv.startCmd(cmd, AddShardsTimeout)
@@ -175,7 +175,7 @@ func (kv *ShardKV) AddShard(args *SendShardArg, reply *AddShardReply) {
 // RPCs to the shardctrler.
 //
 // make_end(servername) turns a server name from a
-// UpConfig.Groups[gid][i] into a labrpc.ClientEnd on which you can
+// UpgradeCfg.Groups[gid][i] into a labrpc.ClientEnd on which you can
 // send RPCs. You'll need this to send RPCs to other groups.
 //
 // look at client.go for examples of how to use masters[]
@@ -263,7 +263,7 @@ func (kv *ShardKV) apply() {
 					case UpgradeConfig:
 						kv.upgradeConfig(op)
 					case AddShard:
-						if kv.cfg.Num < op.SequenceId /*不是最新的配置*/ {
+						if kv.cfg.Num < op.SequenceId /*不是最新的配置，等最新配置*/ {
 							reply.Err = ConfigNotArrived
 						} else /*否则就是最新配置，可以将分片接收*/ {
 							kv.addShard(op)
@@ -314,9 +314,9 @@ func (kv *ShardKV) watch() {
 
 		// 判断是否把不属于自己的部分给分给别人了
 		if !kv.isAllSent() {
-			SeqMap := make(map[int64]int)
+			duptable := make(map[int64]int)
 			for k, v := range kv.duptable {
-				SeqMap[k] = v
+				duptable[k] = v
 			}
 			for shardId, gid := range kv.lastCfg.Shards {
 				// 将最新配置里不属于自己的分片分给别人
@@ -324,11 +324,11 @@ func (kv *ShardKV) watch() {
 					kv.shards[shardId].ConfigNum < kv.cfg.Num {
 					sendDate := kv.cloneShard(kv.cfg.Num, kv.shards[shardId].Data)
 					args := SendShardArg{
-						LastAppliedSequenceId: SeqMap,
-						ShardId:               shardId,
-						Shard:                 sendDate,
-						ClientId:              int64(gid),
-						SequenceId:            kv.cfg.Num,
+						Duptable:   duptable,
+						ShardId:    shardId,
+						Shard:      sendDate,
+						ClientId:   int64(gid),
+						SequenceId: kv.cfg.Num,
 					}
 
 					// shardId -> gid -> server names
@@ -346,7 +346,8 @@ func (kv *ShardKV) watch() {
 							var reply AddShardReply
 							// 对自己的共识组内进行add
 							ok := servers[index].Call("ShardKV.AddShard", args, &reply)
-							// 如果给予切片成功，或者时间超时，这两种情况都需要进行GC掉不属于自己的切片
+							// for Challenge1:
+							// 如果给予分片成功或者时间超时，这两种情况都需要进行GC掉不属于自己的分片
 							if ok && reply.Err == OK || time.Now().Sub(start) >= 2*time.Second {
 								// 如果成功
 								kv.mu.Lock()
@@ -373,6 +374,7 @@ func (kv *ShardKV) watch() {
 			continue
 		}
 
+		//判断切片是否都收到了
 		if !kv.isAllReceived() {
 			kv.mu.Unlock()
 			time.Sleep(UpgradeConfigDuration)
@@ -384,6 +386,7 @@ func (kv *ShardKV) watch() {
 		mck := kv.mck
 		kv.mu.Unlock()
 
+		//按照顺序一次处理一个重新配置请求，不能直接处理最新配置
 		newConfig := mck.Query(curConfig.Num + 1)
 		if newConfig.Num != curConfig.Num+1 {
 			time.Sleep(UpgradeConfigDuration)
@@ -394,7 +397,7 @@ func (kv *ShardKV) watch() {
 			OpType:     UpgradeConfig,
 			ClientId:   int64(kv.gid),
 			SequenceId: newConfig.Num,
-			UpConfig:   newConfig,
+			UpgradeCfg: newConfig,
 		}
 
 		kv.startCmd(cmd, UpConfigTimeout)
@@ -404,32 +407,34 @@ func (kv *ShardKV) watch() {
 // 更新最新的config
 func (kv *ShardKV) upgradeConfig(op Op) {
 	curConfig := kv.cfg
-	upConfig := op.UpConfig
+	upgradeCfg := op.UpgradeCfg
 
-	if curConfig.Num >= upConfig.Num {
+	if curConfig.Num >= upgradeCfg.Num {
 		return
 	}
 
-	for shard, gid := range upConfig.Shards {
+	for shard, gid := range upgradeCfg.Shards {
 		if gid == kv.gid && curConfig.Shards[shard] == 0 {
 			// 如果更新的配置的gid与当前的配置的gid一样且分片为0(未分配）
 			kv.shards[shard].Data = make(map[string]string)
-			kv.shards[shard].ConfigNum = upConfig.Num
+			kv.shards[shard].ConfigNum = upgradeCfg.Num
 		}
 	}
 
 	kv.lastCfg = curConfig
-	kv.cfg = upConfig
+	kv.cfg = upgradeCfg
 }
 
 func (kv *ShardKV) addShard(op Op) {
-	//此分片已添加或者它是过时的 cmd
+	//此分片已添加或者它是过时的cmd
 	if kv.shards[op.ShardId].Data != nil || op.Shard.ConfigNum < kv.cfg.Num {
 		return
 	}
 
 	kv.shards[op.ShardId] = kv.cloneShard(op.Shard.ConfigNum, op.Shard.Data)
 
+	// 查看发送分片过来的分组，更新seqid
+	// 因为当前分片已被当前分组接管，其他附带的数据，诸如duptable也应该拿过来
 	for clientId, seqId := range op.Duptable {
 		if r, ok := kv.duptable[clientId]; !ok || r < seqId {
 			kv.duptable[clientId] = seqId
@@ -443,16 +448,18 @@ func (kv *ShardKV) removeShard(op Op) {
 	}
 	kv.shards[op.ShardId].Data = nil
 	kv.shards[op.ShardId].ConfigNum = op.SequenceId
+	// lab tips: 服务器转移到新配置后，继续存储它不再拥有的分片是可以接受的（尽管这在实际系统中会令人遗憾）。这可能有助于简化您的服务器实现。
+	// 这里无需移除duptable
 }
 
 func (kv *ShardKV) encodeSnapShot() []byte {
 	w := new(bytes.Buffer)
 	status := SnapshotStatus{
-		ShardsPersist: kv.shards,
-		SeqMap:        kv.duptable,
-		MaxRaftState:  kv.maxRaftState,
-		Config:        kv.cfg,
-		LastConfig:    kv.lastCfg,
+		Shards:       kv.shards,
+		Duptable:     kv.duptable,
+		MaxRaftState: kv.maxRaftState,
+		Cfg:          kv.cfg,
+		LastCfg:      kv.lastCfg,
 	}
 	if err := labgob.NewEncoder(w).Encode(status); err != nil {
 		log.Fatalf("[%d-%d] fails to take snapshot.", kv.gid, kv.me)
@@ -469,11 +476,11 @@ func (kv *ShardKV) decodeSnapShot(snapshot []byte) {
 	if labgob.NewDecoder(r).Decode(&status) != nil {
 		log.Fatalf("[Server(%v)] Failed to decode snapshot！！！", kv.me)
 	} else {
-		kv.shards = status.ShardsPersist
-		kv.duptable = status.SeqMap
+		kv.shards = status.Shards
+		kv.duptable = status.Duptable
 		kv.maxRaftState = status.MaxRaftState
-		kv.cfg = status.Config
-		kv.lastCfg = status.LastConfig
+		kv.cfg = status.Cfg
+		kv.lastCfg = status.LastCfg
 	}
 }
 
@@ -544,6 +551,7 @@ func (kv *ShardKV) startCmd(cmd Op, timeoutPeriod time.Duration) Err {
 	select {
 	case re := <-ch:
 		kv.mu.Lock()
+		close(kv.wakeClient[index])
 		delete(kv.wakeClient, index)
 		if re.SequenceId != cmd.SequenceId || re.ClientId != cmd.ClientId {
 			//做到这一点的一种方法是让服务器通过注意到 Start() 返回的索引处出现了不同的请求来检测它是否失去了领导权。

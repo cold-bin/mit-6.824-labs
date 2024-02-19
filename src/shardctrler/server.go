@@ -67,8 +67,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	}
 
 	sc.mu.Lock()
-	ch := make(chan int)
-	sc.wakeClient[index] = ch
+	ch := sc.waitCh(index)
 	sc.mu.Unlock()
 
 	// 延迟释放资源
@@ -324,20 +323,25 @@ func (sc *ShardCtrler) apply() {
 				}
 			}
 
-			if ch, ok := sc.wakeClient[index]; ok /*leader唤醒客户端reply*/ {
-				Debug(dClient, "S%d wakeup client", sc.me)
-				// 避免chan+mutex可能发生的死锁问题
-				sc.mu.Unlock()
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							Debug(dWarn, "recover:%v", r)
-						}
-					}()
-					ch <- term
-				}()
-				sc.mu.Lock()
-			}
+			ch := sc.waitCh(index)
+			sc.mu.Unlock()
+			ch <- term
+			sc.mu.Lock()
+
+			//if ch, ok := sc.wakeClient[index]; ok /*leader唤醒客户端reply*/ {
+			//	Debug(dClient, "S%d wakeup client", sc.me)
+			//	// 避免chan+mutex可能发生的死锁问题
+			//	sc.mu.Unlock()
+			//	func() {
+			//		defer func() {
+			//			if r := recover(); r != nil {
+			//				Debug(dWarn, "recover:%v", r)
+			//			}
+			//		}()
+			//		ch <- term
+			//	}()
+			//	sc.mu.Lock()
+			//}
 		}
 		sc.mu.Unlock()
 	}
@@ -518,4 +522,13 @@ func (sc *ShardCtrler) balance(g2ShardCnt map[int]int, oldShards [NShards]int) [
 	}
 
 	return oldShards
+}
+
+func (sc *ShardCtrler) waitCh(index int) chan int {
+	ch, exist := sc.wakeClient[index]
+	if !exist {
+		sc.wakeClient[index] = make(chan int, 1)
+		ch = sc.wakeClient[index]
+	}
+	return ch
 }

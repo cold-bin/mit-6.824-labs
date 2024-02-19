@@ -61,11 +61,11 @@ type GetReply struct {
 }
 
 type SendShardArg struct {
-	LastAppliedSequenceId map[int64]int // for receiver to update its state
-	ShardId               int
-	Shard                 Shard // Shard to be sent
-	ClientId              int64
-	SequenceId            int
+	Duptable   map[int64]int // for receiver to update its state
+	ShardId    int
+	Shard      Shard // Shard to be sent
+	ClientId   int64
+	SequenceId int
 }
 
 type AddShardReply struct {
@@ -73,9 +73,9 @@ type AddShardReply struct {
 }
 
 type SnapshotStatus struct {
-	ShardsPersist []Shard
-	SeqMap        map[int64]int
-	MaxRaftState  int
-	Config        shardctrler.Config
-	LastConfig    shardctrler.Config
+	Shards       []Shard
+	Duptable     map[int64]int
+	MaxRaftState int
+	Cfg          shardctrler.Config
+	LastCfg      shardctrler.Config
 }
