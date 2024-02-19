@@ -232,6 +232,10 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+func (rf *Raft) RaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
 // PersistentStatus 持久化状态
 type PersistentStatus struct {
 	Log               []Logt

@@ -34,10 +34,11 @@ func nrand() int64 {
 }
 
 type Clerk struct {
-	sm       *shardctrler.Clerk
-	config   shardctrler.Config
-	make_end func(string) *labrpc.ClientEnd
-	// You will have to modify this struct.
+	sm         *shardctrler.Clerk
+	config     shardctrler.Config
+	make_end   func(string) *labrpc.ClientEnd
+	clientId   int64
+	sequenceId int
 }
 
 // the tester calls MakeClerk.
@@ -45,13 +46,16 @@ type Clerk struct {
 // ctrlers[] is needed to call shardctrler.MakeClerk().
 //
 // make_end(servername) turns a server name from a
-// Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
+// UpConfig.Groups[gid][i] into a labrpc.ClientEnd on which you can
 // send RPCs.
 func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
-	// You'll have to add code here.
+	ck.clientId = nrand()
+	ck.sequenceId = 0
+	ck.config = ck.sm.Query(-1)
+
 	return ck
 }
 
@@ -60,10 +64,13 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // keeps trying forever in the face of all other errors.
 // You will have to modify this function.
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
-
+	ck.sequenceId++
 	for {
+		args := GetArgs{
+			Key:        key,
+			ClientId:   ck.clientId,
+			SequenceId: ck.sequenceId,
+		}
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
@@ -92,13 +99,16 @@ func (ck *Clerk) Get(key string) string {
 // shared by Put and Append.
 // You will have to modify this function.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
-
+	ck.sequenceId++
 
 	for {
+		args := PutAppendArgs{
+			Key:        key,
+			Value:      value,
+			Op:         OpType(op),
+			ClientId:   ck.clientId,
+			SequenceId: ck.sequenceId,
+		}
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {

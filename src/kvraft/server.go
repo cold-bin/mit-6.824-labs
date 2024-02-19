@@ -260,6 +260,7 @@ func (kv *KVServer) apply() {
 
 			if preSequenceId, ok := kv.duptable[op.ClientId]; ok &&
 				preSequenceId == op.SequenceId /*应用前需要再判一次重*/ {
+				kv.mu.Unlock()
 			} else /*没有重复，可以应用状态机并记录在table里*/ {
 				kv.duptable[op.ClientId] = op.SequenceId
 				switch op.Type {

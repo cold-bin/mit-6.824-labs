@@ -328,7 +328,14 @@ func (sc *ShardCtrler) apply() {
 				Debug(dClient, "S%d wakeup client", sc.me)
 				// 避免chan+mutex可能发生的死锁问题
 				sc.mu.Unlock()
-				ch <- term
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							Debug(dWarn, "recover:%v", r)
+						}
+					}()
+					ch <- term
+				}()
 				sc.mu.Lock()
 			}
 		}

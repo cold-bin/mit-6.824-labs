@@ -1,5 +1,7 @@
 package shardkv
 
+import "6.5840/shardctrler"
+
 //
 // Sharded key/value server.
 // Lots of replica groups, each running Raft.
@@ -10,23 +12,37 @@ package shardkv
 //
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
+	OK                  Err = "OK"
+	ErrNoKey            Err = "ErrNoKey"
+	ErrWrongGroup       Err = "ErrWrongGroup"
+	ErrWrongLeader      Err = "ErrWrongLeader"
+	ShardNotArrived     Err = "ShardNotArrived"
+	ConfigNotArrived    Err = "ConfigNotArrived"
+	ErrInconsistentData Err = "ErrInconsistentData"
+	ErrOverTime         Err = "ErrOverTime"
 )
+
+const (
+	Put           OpType = "Put"
+	Append        OpType = "Append"
+	Get           OpType = "Get"
+	UpgradeConfig OpType = "UpgradeConfig"
+	AddShard      OpType = "AddShard"
+	RemoveShard   OpType = "RemoveShard"
+)
+
+type OpType string
 
 type Err string
 
 // Put or Append
 type PutAppendArgs struct {
 	// You'll have to add definitions here.
-	Key   string
-	Value string
-	Op    string // "Put" or "Append"
-	// You'll have to add definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Key        string
+	Value      string
+	Op         OpType // "Put" or "Append"
+	ClientId   int64
+	SequenceId int
 }
 
 type PutAppendReply struct {
@@ -34,11 +50,32 @@ type PutAppendReply struct {
 }
 
 type GetArgs struct {
-	Key string
-	// You'll have to add definitions here.
+	Key        string
+	ClientId   int64
+	SequenceId int
 }
 
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+type SendShardArg struct {
+	LastAppliedSequenceId map[int64]int // for receiver to update its state
+	ShardId               int
+	Shard                 Shard // Shard to be sent
+	ClientId              int64
+	SequenceId            int
+}
+
+type AddShardReply struct {
+	Err Err
+}
+
+type SnapshotStatus struct {
+	ShardsPersist []Shard
+	SeqMap        map[int64]int
+	MaxRaftState  int
+	Config        shardctrler.Config
+	LastConfig    shardctrler.Config
 }
