@@ -21,3 +21,4 @@
 ## lab4 sharded-kvstore
 
 - [lab4A-分片控制器](docs-labs-implement/lab4-sharded-kvstore/implement-sharded-kvstore-lab4A.md)
+- [lab4B-分片键/值服务器](docs-labs-implement/lab4-sharded-kvstore/implement-sharded-kvstore-lab4B.md)
