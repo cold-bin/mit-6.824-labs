@@ -721,6 +721,8 @@ func (rf *Raft) logReplicateEvent() {
 			if rf.role == leader {
 				rf.heartbeatBroadcast()
 				rf.electionTimer.Reset(withRandomElectionDuration())
+				// 新增log引起的快速log replicate算一次心跳，减少不必要的心跳发送
+				rf.heartbeatTicker.Reset(withStableHeartbeatDuration())
 			}
 			rf.mu.Unlock()
 		}
