@@ -271,7 +271,9 @@ func (kv *ShardKV) removeShard(op Op) {
 
 ### `watch`协程轮询配置与分片移动
 
-这部分是lab4B的核心了。大体的流程：
+这部分是lab4B的核心了，建模状态机：
+
+![状态机](https://figure.coldbin.top/20240305230352-bc66a0-2f3d797f674fdea9e8e974595e4b494f.png "-")
 
 - leader才有分片发送权力，这样可以保证在集群大多数服务器正常工作的情况下正常服务
 
@@ -393,7 +395,19 @@ func (kv *ShardKV) watch() {
 }
 ```
 
+### 一些问题
 
+前面贴的代码有点问题：偶尔测试爆出race问题，主要是我在处理客户端等待底层raft提交并应用日志时的代码是这样的
+
+```go
+kv.mu.Unlock()
+ch <- reply
+```
+
+但是放锁之后，`ch <- reply`之前，可能会被`clean`函数抢到锁，这就导致了race问题。解决方法有两个：
+
+- 去掉`clean`逻辑。但是这样会使得`wakeClient`不断增大，撑爆内存。（我采取的这种方式
+- 还有一种是先`ch <- reply`再放锁，但是又存在较低的死锁概率（期待无锁chan的实现吧）
 
 ### 结果
 
@@ -426,8 +440,7 @@ Test: unaffected shard access (challenge 2) ...
 Test: partial migration shard access (challenge 2) ...
   ... Passed
 PASS
-ok      6.5840/shardkv  106.350s
-VERBOSE=0 go test -race  217.31s user 3.27s system 204% cpu 1:47.61 total
+ok      6.5840/shardkv  105.103s
+VERBOSE=0 go test -race  208.79s user 2.92s system 197% cpu 1:47.13 total
 ```
-
 
