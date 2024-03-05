@@ -20,6 +20,8 @@ package raft
 import (
 	"6.5840/labgob"
 	"bytes"
+	"fmt"
+
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -119,6 +121,8 @@ type Raft struct {
 	electionTimer   *time.Timer   // random timer
 	heartbeatTicker *time.Ticker  // leader每隔至少100ms一次
 	replicateSignal chan struct{} // 新增的 leader log快速replicate的信号
+
+	replicatePreSnapshot atomic.Bool // 日志复制优先于快照安装进入applyCh
 }
 
 func withRandomElectionDuration() time.Duration {
@@ -598,6 +602,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			rf.lastApplied = args.LastIncludedIndex
 			rf.snapshot = args.Data
 			go func() {
+				// 等待日志复制的日志进入管道过后才能把快照塞入管道
+				for rf.replicatePreSnapshot.Load() {
+					time.Sleep(10 * time.Millisecond)
+				}
 				rf.applyMsg <- msg
 			}()
 
@@ -613,6 +621,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.snapshot = args.Data
 	//8. 使用快照重置状态机（并加载快照的集群配置）
 	go func() {
+		// 等待日志复制的日志进入管道过后才能把快照塞入管道
+		for rf.replicatePreSnapshot.Load() {
+			time.Sleep(10 * time.Millisecond)
+		}
 		rf.applyMsg <- msg
 	}()
 
@@ -738,7 +750,6 @@ func (rf *Raft) applierEvent() {
 			rf.cond.Wait()
 		}
 
-		lastApplied := rf.lastApplied
 		msgs := make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			msgs = append(msgs, ApplyMsg{
@@ -753,17 +764,18 @@ func (rf *Raft) applierEvent() {
 		Debug(dLog2, "S%d need apply msg{%+v}", rf.me, msgs)
 		for _, msg := range msgs {
 			rf.mu.Lock()
-			if msg.CommandIndex != rf.lastApplied+1 /*下一个apply的log一定是lastApplied+1*/ {
+			if msg.CommandIndex != rf.lastApplied+1 /*下一个apply的log一定是lastApplied+1，否则就是被快照按照替代了*/ {
 				rf.mu.Unlock()
 				continue
 			}
+			// 如果执行到这里了，说明下一个msg一定是日志复制，而不是快照安装.
+			rf.replicatePreSnapshot.Store(true) // 快要执行快照安装的协程要先阻塞等待一会
 			rf.mu.Unlock()
-
 			rf.applyMsg <- msg
+			rf.replicatePreSnapshot.Store(false) // 解除快照安装协程的等待
 
 			rf.mu.Lock()
-			lastApplied++
-			rf.lastApplied = max(lastApplied, rf.lastApplied)
+			rf.lastApplied = max(msg.CommandIndex, rf.lastApplied)
 			Debug(dLog2, "S%d lastApplied:%d", rf.me, rf.lastApplied)
 			rf.mu.Unlock()
 		}
@@ -806,7 +818,12 @@ func (rf *Raft) heartbeatBroadcast() {
 			} else if args.PrevLogIndex == rf.lastIncludedIndex /*下一个日志在leader log里，但上一个日志在快照里，没在leader log里*/ {
 				//args.PrevLogIndex = rf.lastIncludedIndex
 				args.PrevLogTerm = rf.log[0].Term
+			} else /*排除极端情况：PrevLogIndex>=rf.lastIncludedIndex+len(rf.log) */ {
+				/*这种情况说明raft实现可能存在问题，因为leader的日志落后于follower了*/
+				panic(fmt.Sprintf(`S%d -> S%d may meet some errors on raft implementation: PrevLogIndex(%d)>={lastIncludedIndex+len(log)(%d)`,
+					rf.me, peer, args.PrevLogIndex, rf.lastIncludedIndex+len(rf.log)))
 			}
+
 			//deep copy
 			args.Entries = append(args.Entries, rf.log[rf.logIndex(rf.nextIndex[peer]):]...)
 
@@ -967,12 +984,12 @@ func (rf *Raft) startElection() {
 			} else if reply.Term == rf.currentTerm && rf.role == candidate /*我们需要确认此刻仍然是candidate，没有发生状态变化*/ {
 				if reply.VoteGranted {
 					approvedNum++
-					if approvedNum > n/2 { /*找到leader了，需要及时广播，防止选举超时*/
-						rf.changeRole(leader)
-						rf.leader = rf.me
-						rf.initializeLeaderEasilyLostState() /*领导人（服务器）上的易失性状态(选举后已经重新初始化)*/
-						rf.heartbeatBroadcast()
-					}
+				}
+				if approvedNum > n/2 { /*找到leader了，需要及时广播，防止选举超时*/
+					rf.changeRole(leader)
+					rf.leader = rf.me
+					rf.initializeLeaderEasilyLostState() /*领导人（服务器）上的易失性状态(选举后已经重新初始化)*/
+					rf.heartbeatBroadcast()
 				}
 			}
 		}(i)
