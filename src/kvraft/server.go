@@ -42,7 +42,14 @@ type KVServer struct {
 
 	duptable   map[int64]int64 //判重
 	data       map[string]string
-	wakeClient map[int]chan int // 存储每个index处的term，用以唤醒客户端
+	wakeClient map[int]chan reqIdentification // 存储每个index处的请求编号，用以唤醒对应客户端
+}
+
+// 唯一对应一个请求
+type reqIdentification struct {
+	ClientId   int64
+	SequenceId int64
+	Err        Err
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -58,14 +65,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	// 如果是leader则会追加成功；否则会失败并返回当前不是leader的错误，客户端定位下一个server
-	index, term, isLeader := kv.rf.Start(op)
+	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Value, reply.Err, reply.Leader = "", ErrNoKey, false
 		return
 	}
 
 	kv.mu.Lock()
-	ch := kv.waitCh(index)
+	ch := make(chan reqIdentification)
+	kv.wakeClient[index] = ch
 	kv.mu.Unlock()
 
 	// 延迟释放资源
@@ -75,8 +83,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	select {
 	case <-time.After(rpcTimeout) /*超时还没有提交*/ :
-	case msgTerm := <-ch /*阻塞等待唤醒*/ :
-		if msgTerm == term /*term一样表示当前leader不是过期的leader*/ {
+	case r := <-ch /*阻塞等待唤醒*/ :
+		if r.ClientId == args.ClientId && r.SequenceId == args.SequenceId /*是对应请求的响应*/ {
 			kv.mu.Lock()
 			if val, ok := kv.data[args.Key]; ok {
 				reply.Value, reply.Err, reply.Leader = val, OK, true
@@ -114,14 +122,14 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	kv.mu.Unlock()
 
-	index, term, isLeader := kv.rf.Start(op)
+	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err, reply.Leader = OK, false
 		return
 	}
 
 	kv.mu.Lock()
-	ch := make(chan int)
+	ch := make(chan reqIdentification)
 	kv.wakeClient[index] = ch
 	kv.mu.Unlock()
 
@@ -131,8 +139,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	select {
 	case <-time.After(rpcTimeout):
-	case msgTerm := <-ch /*阻塞等待*/ :
-		if msgTerm == term /*term一样表示当前leader不是过期的leader*/ {
+	case r := <-ch /*阻塞等待*/ :
+		if r.ClientId == args.ClientId && r.SequenceId == args.SequenceId {
 			reply.Err, reply.Leader = OK, true
 			return
 		}
@@ -145,7 +153,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) clean(i int) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	close(kv.wakeClient[i])
+
+	// don't close a channel from the receiver side
+	// and don't close a channel if the channel has
+	// multiple concurrent senders.
+	// close(kv.wakeClient[i])
+
 	delete(kv.wakeClient, i)
 }
 
@@ -195,7 +208,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		lastApplied:  0,
 		duptable:     make(map[int64]int64),
 		data:         make(map[string]string),
-		wakeClient:   make(map[int]chan int),
+		wakeClient:   make(map[int]chan reqIdentification),
 	}
 
 	kv.replay()
@@ -254,7 +267,6 @@ func (kv *KVServer) apply() {
 				continue
 			}
 			index := msg.CommandIndex
-			term := msg.CommandTerm
 			op := msg.Command.(Op)
 
 			if preSequenceId, ok := kv.duptable[op.ClientId]; ok &&
@@ -278,26 +290,17 @@ func (kv *KVServer) apply() {
 				}
 			}
 
+			// 主要是为了解决潜在死锁问题
+			// 如果客户端还在阻塞，下面这个函数就不会创建容量为1的管道，直接返回
+			// 如果客户端没在阻塞，则需要创建容量为1的管道，防止下面发送管道操作阻塞了
 			ch := kv.waitCh(index)
 			kv.mu.Unlock()
-			ch <- term
+			ch <- reqIdentification{
+				ClientId:   op.ClientId,
+				SequenceId: op.SequenceId,
+				Err:        OK,
+			}
 			kv.mu.Lock()
-			//if ch, ok := kv.wakeClient[index]; ok /*leader唤醒客户端reply*/ {
-			//	Debug(dClient, "S%d wakeup client", kv.me)
-			//	// 避免chan+mutex可能发生的死锁问题
-			//	kv.mu.Unlock()
-			//	func() /*退栈，确保recover捕获nil chan*/ {
-			//		defer func() {
-			//			if r := recover(); r != nil /*大概是客户端超时释放资源了*/ {
-			//				Debug(dInfo, "S%d close nil chan", kv.me)
-			//				return
-			//			}
-			//		}()
-			//		ch <- term
-			//	}()
-			//	kv.mu.Lock()
-			//	//ch <- term
-			//}
 
 			Debug(dApply, "apply msg{%+v}", msg)
 			kv.lastApplied = index // 直接依赖底层raft的实现，不在应用层自己维护lastApplied
@@ -317,10 +320,12 @@ func (kv *KVServer) apply() {
 		kv.mu.Unlock()
 	}
 }
-func (kv *KVServer) waitCh(index int) chan int {
+
+// 一定会得到chan
+func (kv *KVServer) waitCh(index int) chan reqIdentification {
 	ch, exist := kv.wakeClient[index]
 	if !exist {
-		kv.wakeClient[index] = make(chan int, 1)
+		kv.wakeClient[index] = make(chan reqIdentification, 1)
 		ch = kv.wakeClient[index]
 	}
 	return ch

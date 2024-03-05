@@ -17,10 +17,17 @@ type ShardCtrler struct {
 	applyCh chan raft.ApplyMsg
 
 	persister  *raft.Persister
-	duptable   map[int64]int64  //判重
-	wakeClient map[int]chan int // 存储每个index处的term，用以唤醒客户端
+	duptable   map[int64]int64                //判重
+	wakeClient map[int]chan reqIdentification // 存储每个index处的term，用以唤醒客户端
 
 	configs []Config // indexed by config num
+}
+
+// 唯一对应一个请求
+type reqIdentification struct {
+	ClientId   int64
+	SequenceId int64
+	Err        Err
 }
 
 type OpType string
@@ -60,14 +67,15 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	}
 
 	// 先提交给raft
-	index, term, isLeader := sc.rf.Start(op)
+	index, _, isLeader := sc.rf.Start(op)
 	if !isLeader {
 		reply.WrongLeader, reply.Err = true, OK
 		return
 	}
 
 	sc.mu.Lock()
-	ch := sc.waitCh(index)
+	ch := make(chan reqIdentification)
+	sc.wakeClient[index] = ch
 	sc.mu.Unlock()
 
 	// 延迟释放资源
@@ -78,8 +86,8 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	// 等待raft提交
 	select {
 	case <-time.After(rpcTimeout) /*超时还没有提交*/ :
-	case msgTerm := <-ch /*阻塞等待唤醒*/ :
-		if msgTerm == term /*term一样表示当前leader不是过期的leader*/ {
+	case r := <-ch /*阻塞等待唤醒*/ :
+		if r.ClientId == args.ClientId && r.SequenceId == args.SequenceId {
 			reply.WrongLeader, reply.Err = false, OK
 			return
 		}
@@ -108,14 +116,14 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	}
 
 	// 先提交给raft
-	index, term, isLeader := sc.rf.Start(op)
+	index, _, isLeader := sc.rf.Start(op)
 	if !isLeader {
 		reply.WrongLeader, reply.Err = true, OK
 		return
 	}
 
 	sc.mu.Lock()
-	ch := make(chan int)
+	ch := make(chan reqIdentification)
 	sc.wakeClient[index] = ch
 	sc.mu.Unlock()
 
@@ -127,8 +135,8 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// 等待raft提交
 	select {
 	case <-time.After(rpcTimeout) /*超时还没有提交*/ :
-	case msgTerm := <-ch /*阻塞等待唤醒*/ :
-		if msgTerm == term /*term一样表示当前leader不是过期的leader*/ {
+	case r := <-ch /*阻塞等待唤醒*/ :
+		if r.ClientId == args.ClientId && r.SequenceId == args.SequenceId {
 			reply.WrongLeader, reply.Err = false, OK
 			return
 		}
@@ -157,14 +165,14 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	}
 
 	// 先提交给raft
-	index, term, isLeader := sc.rf.Start(op)
+	index, _, isLeader := sc.rf.Start(op)
 	if !isLeader {
 		reply.WrongLeader, reply.Err = true, OK
 		return
 	}
 
 	sc.mu.Lock()
-	ch := make(chan int)
+	ch := make(chan reqIdentification)
 	sc.wakeClient[index] = ch
 	sc.mu.Unlock()
 
@@ -176,8 +184,8 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	// 等待raft提交
 	select {
 	case <-time.After(rpcTimeout) /*超时还没有提交*/ :
-	case msgTerm := <-ch /*阻塞等待唤醒*/ :
-		if msgTerm == term /*term一样表示当前leader不是过期的leader*/ {
+	case r := <-ch /*阻塞等待唤醒*/ :
+		if r.ClientId == args.ClientId && r.SequenceId == args.SequenceId {
 			reply.WrongLeader, reply.Err = false, OK
 			return
 		}
@@ -197,14 +205,14 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	}
 
 	// 先提交给raft
-	index, term, isLeader := sc.rf.Start(op)
+	index, _, isLeader := sc.rf.Start(op)
 	if !isLeader {
 		reply.WrongLeader, reply.Err, reply.Config = true, OK, Config{}
 		return
 	}
 
 	sc.mu.Lock()
-	ch := make(chan int)
+	ch := make(chan reqIdentification)
 	sc.wakeClient[index] = ch
 	sc.mu.Unlock()
 
@@ -216,8 +224,8 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	// 等待raft提交
 	select {
 	case <-time.After(rpcTimeout) /*超时还没有提交*/ :
-	case msgTerm := <-ch /*阻塞等待唤醒*/ :
-		if msgTerm == term /*term一样表示当前leader不是过期的leader*/ {
+	case r := <-ch /*阻塞等待唤醒*/ :
+		if r.ClientId == args.ClientId && r.SequenceId == args.SequenceId {
 			idx := -1
 			sc.mu.Lock()
 			if args.Num == -1 || args.Num > sc.configs[len(sc.configs)-1].Num /*最新配置*/ {
@@ -251,7 +259,6 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 
 func (sc *ShardCtrler) clean(index int) {
 	sc.mu.Lock()
-	close(sc.wakeClient[index])
 	delete(sc.wakeClient, index)
 	sc.mu.Unlock()
 }
@@ -289,7 +296,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 		applyCh:    applyCh,
 		persister:  persister,
 		duptable:   make(map[int64]int64),
-		wakeClient: make(map[int]chan int),
+		wakeClient: make(map[int]chan reqIdentification),
 	}
 	sc.configs = make([]Config, 1)
 	sc.configs[0].Groups = map[int][]string{}
@@ -301,10 +308,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 
 func (sc *ShardCtrler) apply() {
 	for msg := range sc.applyCh {
-		sc.mu.Lock()
 		if msg.CommandValid {
+			sc.mu.Lock()
 			index := msg.CommandIndex
-			term := msg.CommandTerm
 			op := msg.Command.(Op)
 
 			if preSequenceId, ok := sc.duptable[op.ClientId]; ok &&
@@ -325,26 +331,23 @@ func (sc *ShardCtrler) apply() {
 
 			ch := sc.waitCh(index)
 			sc.mu.Unlock()
-			ch <- term
-			sc.mu.Lock()
-
-			//if ch, ok := sc.wakeClient[index]; ok /*leader唤醒客户端reply*/ {
-			//	Debug(dClient, "S%d wakeup client", sc.me)
-			//	// 避免chan+mutex可能发生的死锁问题
-			//	sc.mu.Unlock()
-			//	func() {
-			//		defer func() {
-			//			if r := recover(); r != nil {
-			//				Debug(dWarn, "recover:%v", r)
-			//			}
-			//		}()
-			//		ch <- term
-			//	}()
-			//	sc.mu.Lock()
-			//}
+			ch <- reqIdentification{
+				ClientId:   op.ClientId,
+				SequenceId: op.SequenceId,
+				Err:        OK,
+			}
 		}
-		sc.mu.Unlock()
 	}
+}
+
+// 一定会得到chan
+func (sc *ShardCtrler) waitCh(index int) chan reqIdentification {
+	ch, exist := sc.wakeClient[index]
+	if !exist {
+		sc.wakeClient[index] = make(chan reqIdentification, 1)
+		ch = sc.wakeClient[index]
+	}
+	return ch
 }
 
 func (sc *ShardCtrler) handleJoin(args JoinArgs) {
@@ -443,7 +446,9 @@ func (sc *ShardCtrler) handleMove(args MoveArgs) {
 // 此处将 g2ShardCnt 转化为有序slice。目的：出现负载不能均分的情况时，可以根据这个有序列分配哪些序列应该多分配一个分片，
 // 从而避免分片移动过多。
 //
-//	排序的规则：分片数越多排在前面，分片数相同时，gid大的排在前面
+//		排序的规则：分片数越多排在前面，分片数相同时，gid大的排在前面
+//	 为什么要gid大的排在前面呢？
+//	 主要是规定一个顺序出来，当然也可以gid小的排在前面。防止多次运行的配置分配的结果不一样
 func g2ShardCntSortSlice(g2ShardCnt map[int]int) []int {
 	gids := make([]int, 0, len(g2ShardCnt))
 	for gid, _ := range g2ShardCnt {
@@ -522,13 +527,4 @@ func (sc *ShardCtrler) balance(g2ShardCnt map[int]int, oldShards [NShards]int) [
 	}
 
 	return oldShards
-}
-
-func (sc *ShardCtrler) waitCh(index int) chan int {
-	ch, exist := sc.wakeClient[index]
-	if !exist {
-		sc.wakeClient[index] = make(chan int, 1)
-		ch = sc.wakeClient[index]
-	}
-	return ch
 }

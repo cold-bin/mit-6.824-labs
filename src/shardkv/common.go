@@ -61,11 +61,11 @@ type GetReply struct {
 }
 
 type SendShardArg struct {
-	Duptable   map[int64]int // for receiver to update its state
-	ShardId    int
-	Shard      Shard // Shard to be sent
-	ClientId   int64
-	SequenceId int
+	Duptable map[int64]int // for receiver to update its state
+	ShardId  int
+	Shard    Shard // Shard to be sent
+	ClientId int64
+	CfgNum   int
 }
 
 type AddShardReply struct {

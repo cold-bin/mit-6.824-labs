@@ -17,11 +17,7 @@ import (
 
 const (
 	UpgradeConfigDuration = 100 * time.Millisecond
-	GetTimeout            = 500 * time.Millisecond
-	AppOrPutTimeout       = 500 * time.Millisecond
-	UpConfigTimeout       = 500 * time.Millisecond
-	AddShardsTimeout      = 500 * time.Millisecond
-	RemoveShardsTimeout   = 500 * time.Millisecond
+	rpcTimeout            = 500 * time.Millisecond
 )
 
 type Shard struct {
@@ -31,7 +27,7 @@ type Shard struct {
 
 type Op struct {
 	ClientId   int64
-	SequenceId int
+	SequenceId int // latest cfg num in config
 	OpType     OpType
 
 	// for get/put/append
@@ -94,7 +90,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		Key:        args.Key,
 	}
 
-	if err := kv.startCmd(cmd, GetTimeout); err != OK {
+	if err := kv.startCmd(cmd); err != OK {
 		reply.Err = err
 		return
 	}
@@ -136,7 +132,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Value:      args.Value,
 	}
 
-	reply.Err = kv.startCmd(cmd, AppOrPutTimeout)
+	reply.Err = kv.startCmd(cmd)
 
 	return
 }
@@ -146,13 +142,13 @@ func (kv *ShardKV) AddShard(args *SendShardArg, reply *AddShardReply) {
 	cmd := Op{
 		OpType:     AddShard,
 		ClientId:   args.ClientId,
-		SequenceId: args.SequenceId,
+		SequenceId: args.CfgNum,
 		ShardId:    args.ShardId,
 		Shard:      args.Shard,
 		Duptable:   args.Duptable,
 	}
 
-	reply.Err = kv.startCmd(cmd, AddShardsTimeout)
+	reply.Err = kv.startCmd(cmd)
 
 	return
 }
@@ -324,11 +320,11 @@ func (kv *ShardKV) watch() {
 					kv.shards[shardId].ConfigNum < kv.cfg.Num {
 					sendDate := kv.cloneShard(kv.cfg.Num, kv.shards[shardId].Data)
 					args := SendShardArg{
-						Duptable:   duptable,
-						ShardId:    shardId,
-						Shard:      sendDate,
-						ClientId:   int64(gid),
-						SequenceId: kv.cfg.Num,
+						Duptable: duptable,
+						ShardId:  shardId,
+						Shard:    sendDate,
+						ClientId: int64(gid),
+						CfgNum:   kv.cfg.Num,
 					}
 
 					// shardId -> gid -> server names
@@ -348,7 +344,9 @@ func (kv *ShardKV) watch() {
 							ok := servers[index].Call("ShardKV.AddShard", args, &reply)
 							// for Challenge1:
 							// 如果给予分片成功或者时间超时，这两种情况都需要进行GC掉不属于自己的分片
-							if ok && reply.Err == OK || time.Now().Sub(start) >= 2*time.Second {
+							// 成功：表示对端已经收到这个分片，那么这个分片的请求就一定会成功
+							// 超时：保留一段时间的分片，以供客户端使用分片。这个时间一定要长于服务器崩溃恢复的时间
+							if ok && reply.Err == OK || time.Now().Sub(start) >= 3*time.Second {
 								// 如果成功
 								kv.mu.Lock()
 								cmd := Op{
@@ -358,7 +356,7 @@ func (kv *ShardKV) watch() {
 									ShardId:    args.ShardId,
 								}
 								kv.mu.Unlock()
-								kv.startCmd(cmd, RemoveShardsTimeout)
+								kv.startCmd(cmd)
 								break
 							}
 							index = (index + 1) % len(servers)
@@ -400,7 +398,7 @@ func (kv *ShardKV) watch() {
 			UpgradeCfg: newConfig,
 		}
 
-		kv.startCmd(cmd, UpConfigTimeout)
+		kv.startCmd(cmd)
 	}
 }
 
@@ -511,8 +509,8 @@ func (kv *ShardKV) isDuplicated(clientId int64, seqId int) bool {
 func (kv *ShardKV) waitCh(index int) chan OpReply {
 	ch, exist := kv.wakeClient[index]
 	if !exist {
-		kv.wakeClient[index] = make(chan OpReply, 1)
-		ch = kv.wakeClient[index]
+		ch = make(chan OpReply, 1)
+		kv.wakeClient[index] = ch
 	}
 	return ch
 }
@@ -537,7 +535,7 @@ func (kv *ShardKV) isAllReceived() bool {
 	return true
 }
 
-func (kv *ShardKV) startCmd(cmd Op, timeoutPeriod time.Duration) Err {
+func (kv *ShardKV) startCmd(cmd Op) Err {
 	kv.mu.Lock()
 	index, _, isLeader := kv.rf.Start(cmd)
 	if !isLeader {
@@ -551,16 +549,17 @@ func (kv *ShardKV) startCmd(cmd Op, timeoutPeriod time.Duration) Err {
 	select {
 	case re := <-ch:
 		kv.mu.Lock()
-		close(kv.wakeClient[index])
-		delete(kv.wakeClient, index)
+		kv.clean(index)
 		if re.SequenceId != cmd.SequenceId || re.ClientId != cmd.ClientId {
-			//做到这一点的一种方法是让服务器通过注意到 Start() 返回的索引处出现了不同的请求来检测它是否失去了领导权。
 			kv.mu.Unlock()
 			return ErrInconsistentData
 		}
 		kv.mu.Unlock()
 		return re.Err
-	case <-time.After(timeoutPeriod):
+	case <-time.After(rpcTimeout):
+		kv.mu.Lock()
+		kv.clean(index)
+		kv.mu.Unlock()
 		return ErrOverTime
 	}
 }
@@ -576,4 +575,14 @@ func (kv *ShardKV) cloneShard(ConfigNum int, data map[string]string) Shard {
 	}
 
 	return migrateShard
+}
+
+func (kv *ShardKV) clean(index int) {
+	// wait GC chan, not close chan
+	// don't close a channel from the receiver side
+	// and don't close a channel if the channel has
+	// multiple concurrent senders.
+	// close(kv.wakeClient[i])
+
+	delete(kv.wakeClient, index)
 }
